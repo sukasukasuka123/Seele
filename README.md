@@ -1,3 +1,5 @@
+这个readme是seele自己写的，我觉得企业级名不副实就删掉了
+【Seele——一个Go 语言 Agent 框架，对skill微服务管理，目前不支持除了skill之外的其他功能（这是运行视频）】 https://www.bilibili.com/video/BV1roPHztEiL/?share_source=copy_web&vd_source=34c7d660051de8fffbe62ac8172ffd5f
 基于对项目代码的深入分析，我发现实际功能比原 README 描述的更丰富。以下是更新后的完整 README：
 
 ---
