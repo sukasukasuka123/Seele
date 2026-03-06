@@ -4,7 +4,7 @@
 
 # Seele
 
-名字取自新世纪福音战士（EVANGELION）中的组织 **SEELE**，象征幕后操控的"人类补完委员会"。本项目是对 [microHub](https://github.com/sukasukasuka123/microHub) 的企业级封装，构建了一个**生产就绪**的 Go 语言 Agent 框架。
+名字取自新世纪福音战士（EVANGELION）中的组织 **SEELE**，象征幕后操控的"人类补完委员会"。本项目是对 [microHub](https://github.com/sukasukasuka123/microHub) 的封装，构建了一个**生产就绪**的 Go 语言 Agent 框架。
 
 **核心理念**：每个工具都是独立的 gRPC 微服务，运行在隔离进程中——可独立部署、热替换、崩溃不影响主进程。
 
