@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/template"
 
+	"github.com/sukasukasuka123/microHub/pb_api"
 	pb "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	tool "github.com/sukasukasuka123/microHub/root_class/tool"
 )
@@ -16,52 +18,47 @@ import (
 // ── request / response ──────────────────────────────────────────────────────
 
 type CodegenRequest struct {
-	// skill 基本信息
-	Name        string `json:"name"`        // skill 名称，如 "weather"
-	Port        int    `json:"port"`        // 监听端口，如 50106
-	Description string `json:"description"` // 给 LLM 看的描述（会写进 method 字段注释）
-
-	// 参数结构描述（LLM 填写，codegen 据此生成 struct 和 schema）
-	InputFields  []FieldDef `json:"input_fields"`  // 输入参数列表
-	OutputFields []FieldDef `json:"output_fields"` // 输出参数列表
-
-	// 核心逻辑描述（以 TODO 注释形式嵌入生成代码）
-	LogicHints []string `json:"logic_hints"` // LLM 要实现的逻辑要点，每条一个 TODO
+	Name         string     `json:"name"`
+	Port         int        `json:"port"`
+	Description  string     `json:"description"`
+	InputFields  []FieldDef `json:"input_fields"`
+	OutputFields []FieldDef `json:"output_fields"`
+	LogicHints   []string   `json:"logic_hints"`
 }
 
 type FieldDef struct {
-	Name     string `json:"name"`     // 字段名（小写下划线）
-	Type     string `json:"type"`     // go 类型：string | int | bool | float64
-	JsonTag  string `json:"json_tag"` // json tag，默认同 name
-	Required bool   `json:"required"` // 是否必填
-	Comment  string `json:"comment"`  // 字段注释
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	JsonTag  string `json:"json_tag"`
+	Required bool   `json:"required"`
+	Comment  string `json:"comment"`
 }
 
 type CodegenResponse struct {
 	Name     string `json:"name"`
-	FilePath string `json:"file_path"` // 生成文件的路径
-	Code     string `json:"code"`      // 生成的完整代码
+	FilePath string `json:"file_path"`
+	Code     string `json:"code"`
 	Error    string `json:"error,omitempty"`
 }
 
 // ── handler ─────────────────────────────────────────────────────────────────
 
 type CodegenHandler struct {
-	toolsDir string // tools 放置根目录，来自 .env TOOLS_DIR
+	toolsDir string
 }
 
 func (h *CodegenHandler) ServiceName() string { return "codegen" }
 
-func (h *CodegenHandler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, error) {
+func (h *CodegenHandler) Execute(req *pb.ToolRequest) (<-chan *pb.ToolResponse, error) {
 	var p CodegenRequest
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("参数解析失败: %v", err))
+		return nil, fmt.Errorf("codegen: parse params: %w", err)
 	}
 	if p.Name == "" {
-		return errResp(h.ServiceName(), "name 不能为空")
+		return nil, fmt.Errorf("codegen: name 不能为空")
 	}
 	if p.Port == 0 {
-		return errResp(h.ServiceName(), "port 不能为 0")
+		return nil, fmt.Errorf("codegen: port 不能为 0")
 	}
 
 	// 补全字段默认值
@@ -76,41 +73,56 @@ func (h *CodegenHandler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, error
 		}
 	}
 
-	code, err := generateCode(p)
-	if err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("代码生成失败: %v", err))
-	}
+	ch := make(chan *pb.ToolResponse, 1)
+	go func() {
+		defer close(ch)
 
-	// 写入文件
-	skillDir := filepath.Join(h.toolsDir, p.Name)
-	if err := os.MkdirAll(skillDir, 0755); err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("创建目录失败: %v", err))
-	}
-	filePath := filepath.Join(skillDir, "main.go")
-	if err := os.WriteFile(filePath, []byte(code), 0644); err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("写入文件失败: %v", err))
-	}
+		code, err := generateCode(p)
+		if err != nil {
+			ch <- pb_api.ErrorResp("codegen", req.TaskId, "CODEGEN", err.Error(), "")
+			return
+		}
 
-	resp, rerr := tool.NewOKResp(h.ServiceName(), CodegenResponse{
-		Name:     p.Name,
-		FilePath: filePath,
-		Code:     code,
-	})
-	if rerr != nil {
-		return nil, rerr
-	}
-	return []*pb.ToolResponse{resp}, nil
+		skillDir := filepath.Join(h.toolsDir, p.Name)
+		if err := os.MkdirAll(skillDir, 0755); err != nil {
+			ch <- pb_api.ErrorResp("codegen", req.TaskId, "MKDIR", err.Error(), "")
+			return
+		}
+		filePath := filepath.Join(skillDir, "main.go")
+		if err := os.WriteFile(filePath, []byte(code), 0644); err != nil {
+			ch <- pb_api.ErrorResp("codegen", req.TaskId, "WRITE", err.Error(), "")
+			return
+		}
+
+		resp, err := pb_api.OKResp("codegen", req.TaskId, CodegenResponse{
+			Name:     p.Name,
+			FilePath: filePath,
+			Code:     code,
+		})
+		if err != nil {
+			ch <- pb_api.ErrorResp("codegen", req.TaskId, "BUILD_RESP", err.Error(), "")
+			return
+		}
+		ch <- resp
+		fmt.Printf("[codegen] task=%s name=%s file=%s\n", req.TaskId, p.Name, filePath)
+	}()
+	return ch, nil
 }
 
 // ── code generation ──────────────────────────────────────────────────────────
 
+// 模板生成的 tool 代码已同步改为新版 microHub API：
+//   - Execute 签名：(<-chan *pb.ToolResponse, error)
+//   - pb_api.OKResp / pb_api.ErrorResp 替代 tool.NewOKResp
 const skillTemplate = `package main
 
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	// TODO: 根据实现需要添加其他 import，例如 "net/http"、"os/exec" 等
 
+	"github.com/sukasukasuka123/microHub/pb_api"
 	pb   "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	tool "github.com/sukasukasuka123/microHub/root_class/tool"
 )
@@ -138,30 +150,34 @@ type {{.CapName}}Handler struct{}
 
 func (h *{{.CapName}}Handler) ServiceName() string { return "{{.Name}}" }
 
-func (h *{{.CapName}}Handler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, error) {
+func (h *{{.CapName}}Handler) Execute(req *pb.ToolRequest) (<-chan *pb.ToolResponse, error) {
 	var p {{.CapName}}Request
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("参数解析失败: %v", err))
+		return nil, fmt.Errorf("{{.Name}}: parse params: %w", err)
 	}
-
-	// TODO: 验证必填参数
-	// 示例：if p.SomeField == "" { return errResp(h.ServiceName(), "some_field 不能为空") }
 {{range .Required}}
 	if p.{{.}} == "" {
-		return errResp(h.ServiceName(), "{{toSnake .}} 不能为空")
+		return nil, fmt.Errorf("{{.Name}}: {{toSnake .}} 不能为空")
 	}
 {{- end}}
 
-	result, err := execute(p)
-	if err != nil {
-		result.Error = err.Error()
-	}
+	ch := make(chan *pb.ToolResponse, 1)
+	go func() {
+		defer close(ch)
 
-	resp, rerr := tool.NewOKResp(h.ServiceName(), result)
-	if rerr != nil {
-		return nil, rerr
-	}
-	return []*pb.ToolResponse{resp}, nil
+		result, err := execute(p)
+		if err != nil {
+			result.Error = err.Error()
+		}
+
+		resp, rerr := pb_api.OKResp("{{.Name}}", req.TaskId, result)
+		if rerr != nil {
+			ch <- pb_api.ErrorResp("{{.Name}}", req.TaskId, "BUILD_RESP", rerr.Error(), "")
+			return
+		}
+		ch <- resp
+	}()
+	return ch, nil
 }
 
 // ── core logic ───────────────────────────────────────────────────────────────
@@ -176,24 +192,16 @@ func (h *{{.CapName}}Handler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, 
 {{- end}}
 func execute(p {{.CapName}}Request) ({{.CapName}}Response, error) {
 	// TODO: 在此实现核心逻辑
-
 	return {{.CapName}}Response{}, nil
-}
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-func errResp(name, msg string) ([]*pb.ToolResponse, error) {
-	resp, err := tool.NewOKResp(name, {{.CapName}}Response{Error: msg})
-	if err != nil {
-		return nil, err
-	}
-	return []*pb.ToolResponse{resp}, nil
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	tool.New(&{{.CapName}}Handler{}).Serve(":{{.Port}}")
+	log.Println("[{{.Name}}] 启动，监听 :{{.Port}}")
+	if err := tool.New(&{{.CapName}}Handler{}).Serve(":{{.Port}}"); err != nil {
+		log.Fatalf("[{{.Name}}] %v", err)
+	}
 }
 `
 
@@ -271,7 +279,6 @@ func generateCode(p CodegenRequest) (string, error) {
 
 // ── string helpers ───────────────────────────────────────────────────────────
 
-// capitalize 将 snake_case 转为 PascalCase
 func capitalize(s string) string {
 	parts := strings.Split(s, "_")
 	var b strings.Builder
@@ -284,26 +291,15 @@ func capitalize(s string) string {
 	return b.String()
 }
 
-// toSnakeCase 将 PascalCase 转回 snake_case（用于错误提示）
 func toSnakeCase(s string) string {
 	var b strings.Builder
 	for i, r := range s {
 		if r >= 'A' && r <= 'Z' && i > 0 {
 			b.WriteRune('_')
 		}
-		b.WriteRune(r | 32) // 转小写
+		b.WriteRune(r | 32)
 	}
 	return b.String()
-}
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-func errResp(name, msg string) ([]*pb.ToolResponse, error) {
-	resp, err := tool.NewOKResp(name, CodegenResponse{Error: msg})
-	if err != nil {
-		return nil, err
-	}
-	return []*pb.ToolResponse{resp}, nil
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -313,5 +309,8 @@ func main() {
 	if toolsDir == "" {
 		toolsDir = "micro_tool"
 	}
-	tool.New(&CodegenHandler{toolsDir: toolsDir}).Serve(":50106")
+	log.Println("[codegen] 启动，监听 :50106")
+	if err := tool.New(&CodegenHandler{toolsDir: toolsDir}).Serve(":50106"); err != nil {
+		log.Fatalf("[codegen] %v", err)
+	}
 }

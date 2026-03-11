@@ -291,11 +291,10 @@ type registryRouter struct{}
 func (r *registryRouter) ServiceName() string { return "seele-sdk-hub" }
 
 func (r *registryRouter) Execute(req *pb.ToolRequest) ([]hubbase.DispatchTarget, error) {
-	t, ok := registry.SelectToolByName(req.ServiceName)
+	t, ok := registry.SelectToolByMethod(req.Method)
 	if !ok {
-		return nil, fmt.Errorf("skill %q not in registry", req.ServiceName)
+		return nil, fmt.Errorf("no tool registered for method=%q", req.Method)
 	}
-	req.From = r.ServiceName()
 	return []hubbase.DispatchTarget{
 		{Addr: t.Addr, Request: req, Stream: true},
 	}, nil

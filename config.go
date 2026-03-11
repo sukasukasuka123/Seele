@@ -2,48 +2,94 @@ package Seele
 
 import (
 	"fmt"
-	"time"
+	"os"
 
-	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
-// Config 对应 config.yaml，只包含 LLM 连接参数。
-// Skill 列表统一在 registry.yaml（microHub）中管理，不在这里定义。
-type Config struct {
-	Agent struct {
-		AIURL    string `mapstructure:"ai_url"`
-		AIName   string `mapstructure:"ai_name"`
-		AIAPIKey string `mapstructure:"ai_api_key"`
-	} `mapstructure:"agent"`
+// LoadConfig 从 YAML 文件加载 LLMConfig，并用环境变量覆盖关键字段。
+// seele_api.go 的 Engine.New() 调用此函数。
+//
+// 支持的环境变量：
+//
+//	SEELE_LLM_BASE_URL  → cfg.LLM.BaseURL
+//	SEELE_LLM_API_KEY   → cfg.LLM.APIKey
+//	SEELE_LLM_MODEL     → cfg.LLM.Model
+func LoadConfig(path string) (LLMConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return LLMConfig{}, fmt.Errorf("LoadConfig: read %q: %w", path, err)
+	}
+
+	var app AppConfig
+	if err := yaml.Unmarshal(data, &app); err != nil {
+		return LLMConfig{}, fmt.Errorf("LoadConfig: parse %q: %w", path, err)
+	}
+
+	applyLLMEnv(&app.LLM)
+
+	if app.LLM.BaseURL == "" {
+		return LLMConfig{}, fmt.Errorf("LoadConfig: llm.base_url is required (or set SEELE_LLM_BASE_URL)")
+	}
+	if app.LLM.Model == "" {
+		return LLMConfig{}, fmt.Errorf("LoadConfig: llm.model is required (or set SEELE_LLM_MODEL)")
+	}
+
+	return app.LLM, nil
 }
 
-// LoadConfig 从 YAML 文件加载 LLM 配置，返回 LLMConfig。
+// LoadAppConfig 加载完整的 AppConfig（含 Hub、Registry 配置）。
+// 供 cmd/main.go 等需要读取全部配置的入口使用。
 //
-// 典型用法（registry.Init 在此之前调用）：
+// 支持的环境变量（在 YAML 值基础上覆盖）：
 //
-//	registry.Init("config/registry.yaml")
-//	llmCfg, _ := Seele.LoadConfig("config.yaml")
-//	f, _ := Seele.NewFactory(llmCfg, hub)
-func LoadConfig(path string) (LLMConfig, error) {
-	v := viper.New()
-	v.SetConfigFile(path)
-	if err := v.ReadInConfig(); err != nil {
-		return LLMConfig{}, fmt.Errorf("read config %s: %w", path, err)
+//	SEELE_LLM_BASE_URL   → cfg.LLM.BaseURL
+//	SEELE_LLM_API_KEY    → cfg.LLM.APIKey
+//	SEELE_LLM_MODEL      → cfg.LLM.Model
+//	SEELE_HUB_ADDR       → cfg.Hub.Addr
+//	SEELE_REGISTRY_PATH  → cfg.Registry.Path
+func LoadAppConfig(path string) (AppConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return AppConfig{}, fmt.Errorf("LoadAppConfig: read %q: %w", path, err)
 	}
-	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		return LLMConfig{}, fmt.Errorf("unmarshal config: %w", err)
+
+	var app AppConfig
+	if err := yaml.Unmarshal(data, &app); err != nil {
+		return AppConfig{}, fmt.Errorf("LoadAppConfig: parse %q: %w", path, err)
 	}
-	if cfg.Agent.AIURL == "" {
-		return LLMConfig{}, fmt.Errorf("config %s: agent.ai_url is required", path)
+
+	applyLLMEnv(&app.LLM)
+
+	if v := os.Getenv("SEELE_HUB_ADDR"); v != "" {
+		app.Hub.Addr = v
 	}
-	if cfg.Agent.AIName == "" {
-		return LLMConfig{}, fmt.Errorf("config %s: agent.ai_name is required", path)
+	if v := os.Getenv("SEELE_REGISTRY_PATH"); v != "" {
+		app.Registry.Path = v
 	}
-	return LLMConfig{
-		BaseURL: cfg.Agent.AIURL,
-		Model:   cfg.Agent.AIName,
-		APIKey:  cfg.Agent.AIAPIKey,
-		Timeout: 60 * time.Second,
-	}, nil
+
+	// 默认值
+	if app.Hub.Addr == "" {
+		app.Hub.Addr = ":50051"
+	}
+	if app.Hub.StartupDelayMs <= 0 {
+		app.Hub.StartupDelayMs = 100
+	}
+	if app.Registry.Path == "" {
+		app.Registry.Path = "./config/registry.yaml"
+	}
+
+	return app, nil
+}
+
+func applyLLMEnv(cfg *LLMConfig) {
+	if v := os.Getenv("SEELE_LLM_BASE_URL"); v != "" {
+		cfg.BaseURL = v
+	}
+	if v := os.Getenv("SEELE_LLM_API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
+	if v := os.Getenv("SEELE_LLM_MODEL"); v != "" {
+		cfg.Model = v
+	}
 }

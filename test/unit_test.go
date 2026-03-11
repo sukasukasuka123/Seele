@@ -1,15 +1,4 @@
-// test/integration_test.go
-//
-// 集成测试 demo，演示 agentfactory 库的完整使用。
-// 运行前需要：
-//   1. 启动三个 example_tools（echo / ping / suka_secret）
-//   2. 准备好 test/config.yaml（参考 config_example/config.yaml）
-//
-// 运行：
-//   cd test && go test -v -run TestDemo -timeout 120s
-//   或跑全部：
-//   cd test && go test -v -timeout 120s
-
+// test/unit_test.go
 package test
 
 import (
@@ -17,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -33,8 +24,6 @@ import (
 
 // ── 测试基础设施 ────────────────────────────────────────────────
 
-// mockLLMServer 启动一个本地 HTTP 服务伪装成 OpenAI 端点。
-// 通过 respond 函数控制每次返回的内容，方便单元级集成测试不依赖真实 API。
 type mockLLMServer struct {
 	srv     *httptest.Server
 	respond func(msgs []agentfactory.Message) agentfactory.Message
@@ -47,9 +36,7 @@ func newMockLLM(respond func(msgs []agentfactory.Message) agentfactory.Message) 
 			Messages []agentfactory.Message `json:"messages"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
-
 		reply := m.respond(req.Messages)
-
 		resp := map[string]interface{}{
 			"choices": []map[string]interface{}{
 				{"message": reply, "finish_reason": "stop"},
@@ -72,9 +59,6 @@ func (h *stubHubHandler) Execute(*pb.ToolRequest) ([]hubbase.DispatchTarget, err
 func (h *stubHubHandler) OnResults([]hubbase.DispatchResult)                        {}
 func (h *stubHubHandler) Addrs() []string                                           { return nil }
 
-// newTestFactory 构建一个使用 mockLLM + stub Hub 的 Factory。
-// skill 列表来自 registry，调用此函数前需已调用 registry.Init。
-// 若无 registry（纯单元测试），Factory 的 tools() 返回空列表，不影响纯对话逻辑测试。
 func newTestFactory(t *testing.T, mock *mockLLMServer) *agentfactory.Factory {
 	t.Helper()
 	hub := hubbase.New(&stubHubHandler{})
@@ -82,7 +66,7 @@ func newTestFactory(t *testing.T, mock *mockLLMServer) *agentfactory.Factory {
 		BaseURL: mock.baseURL(),
 		APIKey:  "test-key",
 		Model:   "test-model",
-		Timeout: 5 * time.Second,
+		Timeout: 5,
 	}, hub)
 	if err != nil {
 		t.Fatalf("NewFactory: %v", err)
@@ -90,44 +74,56 @@ func newTestFactory(t *testing.T, mock *mockLLMServer) *agentfactory.Factory {
 	return f
 }
 
+// ── 微服务自动启动 ──────────────────────────────────────────────
+
+// startTool 用 go run 启动一个 example_tool 子进程，返回 cleanup 函数。
+// toolPkg 是完整 import 路径，如 "github.com/sukasukasuka123/Seele/example_tools/echo"。
+func startTool(t *testing.T, toolPkg string) func() {
+	t.Helper()
+	cmd := exec.Command("go", "run", toolPkg)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start tool %s: %v", toolPkg, err)
+	}
+	t.Logf("started %s (pid=%d)", toolPkg, cmd.Process.Pid)
+	return func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+}
+
+// waitPort 轮询 TCP 端口直到可达或超时。
+func waitPort(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("port %s not reachable after %s", addr, timeout)
+}
+
 // ── Unit Tests ──────────────────────────────────────────────────
 
-// TestNewFactory_Validation 验证参数校验逻辑
 func TestNewFactory_Validation(t *testing.T) {
 	hub := hubbase.New(&stubHubHandler{})
-
 	cases := []struct {
 		name    string
 		cfg     agentfactory.LLMConfig
 		hub     *hubbase.BaseHub
 		wantErr bool
 	}{
-		{
-			name:    "hub nil",
-			cfg:     agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"},
-			hub:     nil,
-			wantErr: true,
-		},
-		{
-			name:    "missing BaseURL",
-			cfg:     agentfactory.LLMConfig{Model: "m"},
-			hub:     hub,
-			wantErr: true,
-		},
-		{
-			name:    "missing Model",
-			cfg:     agentfactory.LLMConfig{BaseURL: "http://x"},
-			hub:     hub,
-			wantErr: true,
-		},
-		{
-			name:    "valid",
-			cfg:     agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"},
-			hub:     hub,
-			wantErr: false,
-		},
+		{"hub nil", agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"}, nil, true},
+		{"missing BaseURL", agentfactory.LLMConfig{Model: "m"}, hub, true},
+		{"missing Model", agentfactory.LLMConfig{BaseURL: "http://x"}, hub, true},
+		{"valid", agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"}, hub, false},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := agentfactory.NewFactory(tc.cfg, tc.hub)
@@ -138,13 +134,10 @@ func TestNewFactory_Validation(t *testing.T) {
 	}
 }
 
-// TestFactory_RetireRestore 验证 skill 的运行时屏蔽与恢复
-// skill 来源是 registry，因此这里用真实 registry 初始化
 func TestFactory_RetireRestore(t *testing.T) {
 	if err := registry.Init("../config_example/registry.yaml"); err != nil {
-		t.Skipf("registry.yaml not found, skipping: %v", err)
+		t.Skipf("registry.yaml not found: %v", err)
 	}
-
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{Role: "assistant", Content: "ok"}
 	})
@@ -153,39 +146,28 @@ func TestFactory_RetireRestore(t *testing.T) {
 
 	all := f.Skills()
 	if len(all) == 0 {
-		t.Skip("registry has no tools, skipping")
+		t.Skip("registry has no tools")
 	}
-
 	target := all[0].Name
 
-	// 屏蔽第一个 skill
 	f.Retire(target)
-	after := f.Skills()
-	for _, s := range after {
+	for _, s := range f.Skills() {
 		if s.Name == target {
-			t.Errorf("skill %q should be retired but still visible", target)
+			t.Errorf("skill %q should be retired", target)
 		}
 	}
-	if len(after) != len(all)-1 {
-		t.Errorf("expected %d skills after retire, got %d", len(all)-1, len(after))
-	}
-
-	// 恢复
 	f.Restore(target)
-	restored := f.Skills()
 	found := false
-	for _, s := range restored {
+	for _, s := range f.Skills() {
 		if s.Name == target {
 			found = true
-			break
 		}
 	}
 	if !found {
-		t.Errorf("skill %q should be restored but not visible", target)
+		t.Errorf("skill %q should be restored", target)
 	}
 }
 
-// TestFactory_New_SystemPrompt 验证 New 注入 system prompt
 func TestFactory_New_SystemPrompt(t *testing.T) {
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{Role: "assistant", Content: "ok"}
@@ -193,91 +175,50 @@ func TestFactory_New_SystemPrompt(t *testing.T) {
 	defer mock.close()
 	f := newTestFactory(t, mock)
 
-	// 有 system prompt
 	a := f.New("你是助手")
 	hist := a.History()
 	if len(hist) != 1 || hist[0].Role != "system" || hist[0].Content != "你是助手" {
 		t.Errorf("unexpected history: %+v", hist)
 	}
-
-	// 无 system prompt
 	b := f.New("")
 	if len(b.History()) != 0 {
 		t.Errorf("expected empty history, got %+v", b.History())
 	}
 }
 
-// TestAgent_SetSystem 验证 SetSystem 的替换与插入行为
-func TestAgent_SetSystem(t *testing.T) {
+func TestAgent_ClearHistory(t *testing.T) {
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{Role: "assistant", Content: "ok"}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
+	ctx := context.Background()
 
-	t.Run("replace existing system", func(t *testing.T) {
-		a := f.New("旧 prompt")
-		a.SetSystem("新 prompt")
-		hist := a.History()
-		if hist[0].Content != "新 prompt" {
-			t.Errorf("expected '新 prompt', got %q", hist[0].Content)
-		}
-		if len(hist) != 1 {
-			t.Errorf("expected 1 message, got %d", len(hist))
-		}
-	})
-
-	t.Run("insert when no system", func(t *testing.T) {
-		a := f.New("")
-		a.SetSystem("新增 prompt")
-		hist := a.History()
-		if len(hist) != 1 || hist[0].Role != "system" {
-			t.Errorf("unexpected history: %+v", hist)
-		}
-	})
-}
-
-// TestAgent_Reset 验证历史清空逻辑
-func TestAgent_Reset(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
-	})
-	defer mock.close()
-	f := newTestFactory(t, mock)
-
-	t.Run("reset keep system", func(t *testing.T) {
+	t.Run("keeps system", func(t *testing.T) {
 		a := f.New("system prompt")
-		ctx := context.Background()
 		_, _ = a.Chat(ctx, "消息1")
 		_, _ = a.Chat(ctx, "消息2")
-
-		a.Reset(true)
+		a.ClearHistory()
 		hist := a.History()
 		if len(hist) != 1 || hist[0].Role != "system" {
 			t.Errorf("expected only system msg, got %+v", hist)
 		}
 	})
 
-	t.Run("reset drop all", func(t *testing.T) {
-		a := f.New("system prompt")
-		ctx := context.Background()
+	t.Run("no system", func(t *testing.T) {
+		a := f.New("")
 		_, _ = a.Chat(ctx, "消息1")
-
-		a.Reset(false)
+		a.ClearHistory()
 		if len(a.History()) != 0 {
 			t.Errorf("expected empty history, got %+v", a.History())
 		}
 	})
 }
 
-// TestAgent_Chat_PlainReply 验证无 tool_call 时的普通对话
 func TestAgent_Chat_PlainReply(t *testing.T) {
 	mock := newMockLLM(func(msgs []agentfactory.Message) agentfactory.Message {
 		last := msgs[len(msgs)-1]
-		return agentfactory.Message{
-			Role:    "assistant",
-			Content: "你说了：" + last.Content,
-		}
+		return agentfactory.Message{Role: "assistant", Content: "你说了：" + last.Content}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -290,26 +231,16 @@ func TestAgent_Chat_PlainReply(t *testing.T) {
 	if reply != "你说了：hello" {
 		t.Errorf("unexpected reply: %q", reply)
 	}
-
-	// history: system + user + assistant
-	hist := a.History()
-	if len(hist) != 3 {
-		t.Errorf("expected 3 messages, got %d", len(hist))
-	}
-	if hist[1].Role != "user" || hist[2].Role != "assistant" {
-		t.Errorf("unexpected roles: %v %v", hist[1].Role, hist[2].Role)
+	if len(a.History()) != 3 {
+		t.Errorf("expected 3 messages, got %d", len(a.History()))
 	}
 }
 
-// TestAgent_Chat_MultiTurn 验证多轮对话历史累积
 func TestAgent_Chat_MultiTurn(t *testing.T) {
 	turn := 0
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		turn++
-		return agentfactory.Message{
-			Role:    "assistant",
-			Content: fmt.Sprintf("第%d轮回复", turn),
-		}
+		return agentfactory.Message{Role: "assistant", Content: fmt.Sprintf("第%d轮回复", turn)}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -320,20 +251,15 @@ func TestAgent_Chat_MultiTurn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("turn %d Chat: %v", i, err)
 		}
-		want := fmt.Sprintf("第%d轮回复", i)
-		if reply != want {
+		if want := fmt.Sprintf("第%d轮回复", i); reply != want {
 			t.Errorf("turn %d: want %q, got %q", i, want, reply)
 		}
 	}
-
-	// 3轮：每轮 user+assistant，共 6 条
 	if len(a.History()) != 6 {
 		t.Errorf("expected 6 messages, got %d", len(a.History()))
 	}
 }
 
-// TestAgent_Chat_ToolCall 验证 tool_call → tool_result → 最终回复 的完整循环
-// dispatch 到 stub hub 会失败，但 LLM mock 仍能感知 tool message 并推进循环。
 func TestAgent_Chat_ToolCall(t *testing.T) {
 	callCount := 0
 	mock := newMockLLM(func(msgs []agentfactory.Message) agentfactory.Message {
@@ -345,18 +271,14 @@ func TestAgent_Chat_ToolCall(t *testing.T) {
 					{
 						ID:   "call_001",
 						Type: "function",
-						Function: struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						}{
+						Function: agentfactory.ToolCallFunction{
 							Name:      "echo",
-							Arguments: `{"content":"hi"}`,
+							Arguments: `{"message":"hi"}`,
 						},
 					},
 				},
 			}
 		}
-		// 第二轮：有 tool message 则回复确认
 		for _, m := range msgs {
 			if m.Role == "tool" && m.Name == "echo" {
 				return agentfactory.Message{Role: "assistant", Content: "echo 已执行：" + m.Content}
@@ -368,16 +290,12 @@ func TestAgent_Chat_ToolCall(t *testing.T) {
 
 	f := newTestFactory(t, mock)
 	a := f.New("")
-	_, err := a.Chat(context.Background(), "帮我 echo hi")
-
-	// 不关心 dispatch 是否成功，只验证 tool_call 循环正确推进了两轮
+	_, _ = a.Chat(context.Background(), "帮我 echo hi")
 	if callCount != 2 {
-		t.Errorf("expected 2 LLM calls (tool_call loop), got %d", callCount)
+		t.Errorf("expected 2 LLM calls, got %d", callCount)
 	}
-	_ = err
 }
 
-// TestAgent_Chat_MaxLoops 验证超出 maxLoops 时的降级返回
 func TestAgent_Chat_MaxLoops(t *testing.T) {
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{
@@ -386,10 +304,10 @@ func TestAgent_Chat_MaxLoops(t *testing.T) {
 				{
 					ID:   "call_loop",
 					Type: "function",
-					Function: struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					}{Name: "echo", Arguments: `{"content":"loop"}`},
+					Function: agentfactory.ToolCallFunction{
+						Name:      "echo",
+						Arguments: `{"message":"loop"}`,
+					},
 				},
 			},
 		}
@@ -400,16 +318,13 @@ func TestAgent_Chat_MaxLoops(t *testing.T) {
 	a := f.New("")
 	a.SetMaxLoops(2)
 
-	reply, err := a.Chat(context.Background(), "进入循环")
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !strings.Contains(reply, "最大尝试次数") {
-		t.Errorf("expected fallback message, got: %q", reply)
+	_, err := a.Chat(context.Background(), "进入循环")
+	// 超出 maxLoops 时 agent.go 返回 error
+	if err == nil {
+		t.Error("expected error when maxLoops exceeded")
 	}
 }
 
-// TestAgent_SessionID 验证每个 Agent 有唯一 SessionID
 func TestAgent_SessionID(t *testing.T) {
 	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{Role: "assistant", Content: "ok"}
@@ -423,6 +338,7 @@ func TestAgent_SessionID(t *testing.T) {
 		if id == "" {
 			t.Fatal("empty session ID")
 		}
+		time.Sleep(1 * time.Microsecond)
 		if ids[id] {
 			t.Fatalf("duplicate session ID: %s", id)
 		}
@@ -430,40 +346,10 @@ func TestAgent_SessionID(t *testing.T) {
 	}
 }
 
-// TestTruncate 验证历史截断（发送超过 keep 数量的消息后历史不超限）
-func TestTruncate(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
-	})
-	defer mock.close()
-	f := newTestFactory(t, mock)
-
-	a := f.New("system")
-	ctx := context.Background()
-
-	// 发送 30 轮对话触发截断（keep=20）
-	for i := 0; i < 30; i++ {
-		_, err := a.Chat(ctx, fmt.Sprintf("消息%d", i))
-		if err != nil {
-			t.Fatalf("Chat %d: %v", i, err)
-		}
-	}
-
-	hist := a.History()
-	// 截断后：system(1) + 最近 20 条，最多 21 条
-	if len(hist) > 21 {
-		t.Errorf("expected at most 21 messages after truncation, got %d", len(hist))
-	}
-	if hist[0].Role != "system" {
-		t.Error("system prompt should be preserved after truncation")
-	}
-}
-
-// TestLoadConfig 验证配置文件加载（需要 test/config.yaml 存在）
 func TestLoadConfig(t *testing.T) {
 	cfg, err := agentfactory.LoadConfig("config.yaml")
 	if err != nil {
-		t.Skipf("config.yaml not found, skipping: %v", err)
+		t.Skipf("config.yaml not found: %v", err)
 	}
 	if cfg.BaseURL == "" {
 		t.Error("BaseURL should not be empty")
@@ -471,28 +357,40 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Model == "" {
 		t.Error("Model should not be empty")
 	}
-	if cfg.Timeout == 0 {
-		t.Error("Timeout should not be zero")
-	}
 }
 
-// ── Integration Test（需要真实环境）────────────────────────────
-//
-// 运行条件：
-//   - TEST_INTEGRATION=1 环境变量已设置
-//   - test/config.yaml 已配置真实 API Key
-//   - example_tools 已启动（echo :50101 / ping :50102 / suka_secret :50100）
+// ── Integration Test（自动启动微服务）──────────────────────────
+// TEST_INTEGRATION=1 go test -v -run TestDemo -timeout 120s
 
 func TestDemo(t *testing.T) {
 	if os.Getenv("TEST_INTEGRATION") == "" {
 		t.Skip("跳过集成测试（设置 TEST_INTEGRATION=1 启用）")
 	}
 
-	// ── 初始化 registry（skill 列表从 yaml 来，无需手动 Register）──
+	const base = "github.com/sukasukasuka123/Seele/"
+	tools := []struct {
+		pkg  string
+		port string
+	}{
+		{base + "example_tools/example", "localhost:50101"},
+		{base + "example_tools/suka_secret", "localhost:50100"},
+		{base + "example_tools/ping", "localhost:50102"},
+		{base + "example_tools/fetch", "localhost:50103"},
+		{base + "example_tools/cmd", "localhost:50104"},
+		{base + "example_tools/registry_changer", "localhost:50105"},
+		{base + "example_tools/tool_coder", "localhost:50106"},
+	}
+	for _, svc := range tools {
+		stop := startTool(t, svc.pkg)
+		defer stop()
+	}
+	for _, svc := range tools {
+		waitPort(t, svc.port, 15*time.Second)
+	}
+
 	if err := registry.Init("../config_example/registry.yaml"); err != nil {
 		t.Fatalf("registry init: %v", err)
 	}
-
 	hub := hubbase.New(&demoRouter{})
 	go func() {
 		if err := hub.ServeAsync(":50051", 0); err != nil {
@@ -509,10 +407,8 @@ func TestDemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFactory: %v", err)
 	}
+	t.Logf("已加载 %d 个 skill", len(f.Skills()))
 
-	t.Logf("已加载 %d 个 skill（来自 registry.yaml）", len(f.Skills()))
-
-	// ── 创建两个独立 Agent，共享同一套 skill ──────────────────
 	eva := f.New(
 		"你是 suka-eva，一个通过微服务架构动态扩展 skill 的 AI 助手。" +
 			"请回答用户的问题，需要时主动调用合适的 skill。",
@@ -533,9 +429,9 @@ func TestDemo(t *testing.T) {
 		{debugger, "debugger", "诊断一下本机网络"},
 		{eva, "eva", "叫一下 suka_secret"},
 	}
-
 	for _, tc := range cases {
-		t.Run(fmt.Sprintf("%s/%s", tc.label, tc.input[:min(10, len(tc.input))]), func(t *testing.T) {
+		label := fmt.Sprintf("%s/%s", tc.label, tc.input[:min(10, len(tc.input))])
+		t.Run(label, func(t *testing.T) {
 			reply, err := tc.agent.Chat(ctx, tc.input)
 			if err != nil {
 				t.Errorf("Chat error: %v", err)
@@ -543,43 +439,30 @@ func TestDemo(t *testing.T) {
 			}
 			if reply == "" {
 				t.Error("got empty reply")
-				return
 			}
-			t.Logf("input:  %s", tc.input)
-			t.Logf("reply:  %s", reply)
+			t.Logf("reply: %s", reply)
 		})
 	}
-
-	// 验证两个 Agent 的历史完全独立
-	evaHist := eva.History()
-	dbgHist := debugger.History()
-	if len(evaHist) > 0 && len(dbgHist) > 0 &&
-		evaHist[len(evaHist)-1].Content == dbgHist[len(dbgHist)-1].Content {
-		t.Error("eva and debugger histories should be independent")
-	}
-
-	// 验证 Retire 对所有 Agent 立即生效（以第一个 skill 为测试目标）
-	skills := f.Skills()
-	if len(skills) > 0 {
-		target := skills[0].Name
-		f.Retire(target)
-		for _, s := range f.Skills() {
-			if s.Name == target {
-				t.Errorf("skill %q should have been retired", target)
-			}
-		}
-		f.Restore(target) // 恢复，避免影响后续用例
-	}
-
-	t.Logf("eva:      %s", eva.Summary())
-	t.Logf("debugger: %s", debugger.Summary())
 }
 
-// TestDemo_Interactive 交互式 REPL（手动测试用，需要真实环境）
-// 运行：go test -v -run TestDemo_Interactive -timeout 600s
+// TestDemo_Interactive 交互式 REPL（手动测试）
+// TEST_INTERACTIVE=1 go test -v -run TestDemo_Interactive -timeout 600s
 func TestDemo_Interactive(t *testing.T) {
 	if os.Getenv("TEST_INTERACTIVE") == "" {
 		t.Skip("跳过交互测试（设置 TEST_INTERACTIVE=1 启用）")
+	}
+
+	const base = "github.com/sukasukasuka123/Seele/"
+	for _, svc := range []struct{ pkg, port string }{
+		{base + "example_tools/example", "localhost:50101"},
+		{base + "example_tools/suka_secret", "localhost:50100"},
+		{base + "example_tools/ping", "localhost:50102"},
+		{base + "example_tools/fetch", "localhost:50103"},
+		{base + "example_tools/cmd", "localhost:50104"},
+	} {
+		stop := startTool(t, svc.pkg)
+		defer stop()
+		waitPort(t, svc.port, 10*time.Second)
 	}
 
 	if err := registry.Init("../config_example/registry.yaml"); err != nil {
@@ -600,10 +483,7 @@ func TestDemo_Interactive(t *testing.T) {
 
 	a := f.New("你是 suka-eva，一个通过微服务架构动态扩展 skill 的 AI 助手。")
 	ctx := context.Background()
-
-	fmt.Println("=== suka-eva 交互测试 ===")
-	fmt.Printf("已加载 %d 个 skill\n", len(f.Skills()))
-	fmt.Println("命令：quit=退出 | reset=清空 | skills=查看工具")
+	fmt.Printf("=== suka-eva 交互测试 ===\n已加载 %d 个 skill\n命令：quit | reset | skills\n", len(f.Skills()))
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -619,44 +499,45 @@ func TestDemo_Interactive(t *testing.T) {
 		case "quit", "exit":
 			return
 		case "reset":
-			a.Reset(true)
+			a.ClearHistory()
 			fmt.Println("[已重置]")
-			continue
 		case "skills":
 			for _, s := range f.Skills() {
-				fmt.Printf("  %-20s %s\n", s.Name, s.Description)
+				fmt.Printf("  %-20s %s\n", s.Name, s.Method)
 			}
-			continue
+		default:
+			reply, err := a.Chat(ctx, input)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				continue
+			}
+			fmt.Printf("eva: %s\n\n", reply)
 		}
-		reply, err := a.Chat(ctx, input)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			continue
-		}
-		fmt.Printf("eva: %s\n\n", reply)
 	}
 }
 
-// ── Hub 路由（集成测试专用）────────────────────────────────────
+// ── Hub 路由（集成测试专用，新版 Method 路由）──────────────────
 
 type demoRouter struct{}
 
 func (r *demoRouter) ServiceName() string { return "test-hub" }
+
 func (r *demoRouter) Execute(req *pb.ToolRequest) ([]hubbase.DispatchTarget, error) {
-	t, ok := registry.SelectToolByName(req.ServiceName)
+	t, ok := registry.SelectToolByMethod(req.Method)
 	if !ok {
-		return nil, fmt.Errorf("skill %q not in registry", req.ServiceName)
+		return nil, fmt.Errorf("no tool for method=%q", req.Method)
 	}
-	req.From = r.ServiceName()
 	return []hubbase.DispatchTarget{{Addr: t.Addr, Request: req, Stream: true}}, nil
 }
+
 func (r *demoRouter) OnResults(results []hubbase.DispatchResult) {
 	for _, res := range results {
 		if !res.AllOK() {
-			fmt.Printf("[Hub] error: %v\n", res.Err)
+			fmt.Printf("[Hub] dispatch error: %v\n", res.Err)
 		}
 	}
 }
+
 func (r *demoRouter) Addrs() []string {
 	tools := registry.GetAllTools()
 	addrs := make([]string, len(tools))

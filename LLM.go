@@ -2,6 +2,7 @@ package Seele
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,93 +10,108 @@ import (
 	"time"
 )
 
-// LLMConfig 是 LLM 客户端的连接参数。
-type LLMConfig struct {
-	BaseURL string // 兼容任何 OpenAI 格式的端点（Aliyun、Azure、vLLM 等）
-	APIKey  string
-	Model   string
-	Timeout time.Duration // 默认 60s
-}
-
-// llmClient 是无状态的 HTTP 客户端，不持有任何对话历史。
-// 多个 Agent 可以安全地共用同一个实例。
+// llmClient 是对 OpenAI 兼容 /v1/chat/completions 的轻量封装。
+// 无第三方依赖，纯标准库 net/http。
 type llmClient struct {
-	cfg  LLMConfig
-	http *http.Client
+	cfg    LLMConfig
+	client *http.Client
 }
 
 func newLLMClient(cfg LLMConfig) *llmClient {
 	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 60 * time.Second
+	if timeout <= 0 {
+		timeout = 60
 	}
 	return &llmClient{
-		cfg:  cfg,
-		http: &http.Client{Timeout: timeout},
+		cfg:    cfg,
+		client: &http.Client{Timeout: time.Duration(timeout) * time.Second},
 	}
 }
 
-// chat 发送一次对话请求，返回 LLM 的回复消息。
-func (c *llmClient) chat(messages []Message, tools []Tool) (Message, error) {
-	req := chatRequest{
-		Model:    c.cfg.Model,
-		Messages: messages,
-		Stream:   false,
+// ── 请求 / 响应结构体（仅在本文件使用）────────────────────────────
+
+type chatCompletionRequest struct {
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Tools       []Tool    `json:"tools,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Temperature float64   `json:"temperature,omitempty"`
+}
+
+type chatCompletionResponse struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
+// ── 核心方法 ──────────────────────────────────────────────────────
+
+// complete 发送一次对话补全请求，返回模型的回复 Message。
+//
+//   - 若模型发起 tool_calls，Message.ToolCalls 非空，Message.Content 可能为空。
+//   - 若模型直接回复，Message.Content 为文本，Message.ToolCalls 为空。
+func (c *llmClient) complete(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
+	temperature := c.cfg.Temperature
+	if temperature == 0 {
+		temperature = 1.0
+	}
+
+	reqBody := chatCompletionRequest{
+		Model:       c.cfg.Model,
+		Messages:    messages,
+		MaxTokens:   c.cfg.MaxTokens,
+		Temperature: temperature,
 	}
 	if len(tools) > 0 {
-		req.Tools = tools
+		reqBody.Tools = tools
 	}
 
-	body, err := c.post("/chat/completions", req)
+	raw, err := json.Marshal(reqBody)
 	if err != nil {
-		return Message{}, err
+		return Message{}, fmt.Errorf("llmClient: marshal request: %w", err)
 	}
 
-	var resp chatResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return Message{}, fmt.Errorf("decode response: %w", err)
-	}
-	if resp.Error != nil {
-		return Message{}, fmt.Errorf("llm error [%s]: %s", resp.Error.Type, resp.Error.Message)
-	}
-	if len(resp.Choices) == 0 {
-		return Message{}, fmt.Errorf("llm returned empty choices")
-	}
-	return resp.Choices[0].Message, nil
-}
-
-func (c *llmClient) post(path string, payload interface{}) ([]byte, error) {
-	data, err := json.Marshal(payload)
+	httpReq, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.cfg.BaseURL+"/chat/completions",
+		bytes.NewReader(raw),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("marshal: %w", err)
+		return Message{}, fmt.Errorf("llmClient: build request: %w", err)
 	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
-	req, err := http.NewRequest(http.MethodPost, c.cfg.BaseURL+path, bytes.NewReader(data))
+	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return Message{}, fmt.Errorf("llmClient: HTTP: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	defer resp.Body.Close()
 
-	res, err := c.http.Do(req)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("http: %w", err)
-	}
-	defer res.Body.Close()
-
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return Message{}, fmt.Errorf("llmClient: read response: %w", err)
 	}
 
-	if res.StatusCode != http.StatusOK {
-		var wrap struct {
-			Error *apiError `json:"error"`
-		}
-		if json.Unmarshal(b, &wrap) == nil && wrap.Error != nil {
-			return nil, fmt.Errorf("http %d [%s]: %s", res.StatusCode, wrap.Error.Type, wrap.Error.Message)
-		}
-		return nil, fmt.Errorf("http %d: %s", res.StatusCode, string(b))
+	var cr chatCompletionResponse
+	if err := json.Unmarshal(data, &cr); err != nil {
+		return Message{}, fmt.Errorf("llmClient: parse response: %w\nraw: %.512s", err, data)
 	}
-	return b, nil
+	if cr.Error != nil {
+		return Message{}, fmt.Errorf("llmClient: API error [%s/%s]: %s",
+			cr.Error.Type, cr.Error.Code, cr.Error.Message)
+	}
+	if len(cr.Choices) == 0 {
+		return Message{}, fmt.Errorf("llmClient: empty choices\nraw: %.512s", data)
+	}
+
+	return cr.Choices[0].Message, nil
 }

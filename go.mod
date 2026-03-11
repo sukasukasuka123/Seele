@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/spf13/viper v1.21.0
-	github.com/sukasukasuka123/microHub v0.1.1
+	github.com/sukasukasuka123/microHub v0.1.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 

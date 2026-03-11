@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,11 +12,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/sukasukasuka123/microHub/pb_api"
 	pb "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	tool "github.com/sukasukasuka123/microHub/root_class/tool"
 )
 
-// ── registry yaml structures ─────────────────────────────────────────────────
+// ── registry yaml structures（不变）─────────────────────────────────────────
 
 type ToolEntry struct {
 	Name         string `yaml:"name"`
@@ -41,14 +43,14 @@ type RegistryFile struct {
 	} `yaml:"pool"`
 }
 
-// ── request / response ──────────────────────────────────────────────────────
+// ── request / response（不变）───────────────────────────────────────────────
 
 type RegistryRequest struct {
-	Action      string    `json:"action"`       // list | add | remove | update
-	Tool        ToolEntry `json:"tool"`         // add/update 时使用
-	Name        string    `json:"name"`         // remove/update 时的目标名
-	WaitOnline  bool      `json:"wait_online"`  // add 时是否等待端口可达再写入
-	WaitTimeout int       `json:"wait_timeout"` // 等待超时秒数，默认 30
+	Action      string    `json:"action"`
+	Tool        ToolEntry `json:"tool"`
+	Name        string    `json:"name"`
+	WaitOnline  bool      `json:"wait_online"`
+	WaitTimeout int       `json:"wait_timeout"`
 }
 
 type RegistryResponse struct {
@@ -66,41 +68,51 @@ type RegistryHandler struct {
 
 func (h *RegistryHandler) ServiceName() string { return "registry" }
 
-func (h *RegistryHandler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, error) {
+func (h *RegistryHandler) Execute(req *pb.ToolRequest) (<-chan *pb.ToolResponse, error) {
 	var p RegistryRequest
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return errResp(h.ServiceName(), fmt.Sprintf("参数解析失败: %v", err))
+		return nil, fmt.Errorf("registry: parse params: %w", err)
 	}
 
-	var result RegistryResponse
-	var opErr error
+	ch := make(chan *pb.ToolResponse, 1)
+	go func() {
+		defer close(ch)
 
-	switch p.Action {
-	case "list":
-		result, opErr = h.list()
-	case "add":
-		result, opErr = h.add(p)
-	case "remove":
-		result, opErr = h.remove(p.Name)
-	case "update":
-		result, opErr = h.update(p)
-	default:
-		return errResp(h.ServiceName(), fmt.Sprintf("未知 action: %q，支持: list | add | remove | update", p.Action))
-	}
+		var result RegistryResponse
+		var opErr error
 
-	if opErr != nil {
-		result.Error = opErr.Error()
-	}
-	result.Action = p.Action
+		switch p.Action {
+		case "list":
+			result, opErr = h.list()
+		case "add":
+			result, opErr = h.add(p)
+		case "remove":
+			result, opErr = h.remove(p.Name)
+		case "update":
+			result, opErr = h.update(p)
+		default:
+			ch <- pb_api.ErrorResp("registry", req.TaskId, "BAD_ACTION",
+				fmt.Sprintf("未知 action: %q，支持: list | add | remove | update", p.Action), "")
+			return
+		}
 
-	resp, err := tool.NewOKResp(h.ServiceName(), result)
-	if err != nil {
-		return nil, err
-	}
-	return []*pb.ToolResponse{resp}, nil
+		if opErr != nil {
+			result.Error = opErr.Error()
+		}
+		result.Action = p.Action
+
+		resp, err := pb_api.OKResp("registry", req.TaskId, result)
+		if err != nil {
+			ch <- pb_api.ErrorResp("registry", req.TaskId, "BUILD_RESP", err.Error(), "")
+			return
+		}
+		ch <- resp
+		fmt.Printf("[registry] task=%s action=%s changed=%v\n", req.TaskId, p.Action, result.Changed)
+	}()
+	return ch, nil
 }
 
-// ── operations ───────────────────────────────────────────────────────────────
+// ── operations（不变）───────────────────────────────────────────────────────
 
 func (h *RegistryHandler) load() (RegistryFile, error) {
 	var rf RegistryFile
@@ -134,8 +146,6 @@ func (h *RegistryHandler) add(p RegistryRequest) (RegistryResponse, error) {
 	if p.Tool.Name == "" || p.Tool.Addr == "" {
 		return RegistryResponse{}, fmt.Errorf("tool.name 和 tool.addr 不能为空")
 	}
-
-	// 等待端口上线
 	if p.WaitOnline {
 		timeout := p.WaitTimeout
 		if timeout <= 0 {
@@ -145,19 +155,15 @@ func (h *RegistryHandler) add(p RegistryRequest) (RegistryResponse, error) {
 			return RegistryResponse{}, fmt.Errorf("等待 %s 上线超时: %w", p.Tool.Addr, err)
 		}
 	}
-
 	rf, err := h.load()
 	if err != nil {
 		return RegistryResponse{}, err
 	}
-
-	// 检查是否已存在
 	for _, t := range rf.Services.Tools {
 		if t.Name == p.Tool.Name {
 			return RegistryResponse{Changed: false}, fmt.Errorf("skill %q 已存在，请用 update", p.Tool.Name)
 		}
 	}
-
 	rf.Services.Tools = append(rf.Services.Tools, p.Tool)
 	if err := h.save(rf); err != nil {
 		return RegistryResponse{}, err
@@ -173,7 +179,6 @@ func (h *RegistryHandler) remove(name string) (RegistryResponse, error) {
 	if err != nil {
 		return RegistryResponse{}, err
 	}
-
 	original := len(rf.Services.Tools)
 	var kept []ToolEntry
 	for _, t := range rf.Services.Tools {
@@ -184,7 +189,6 @@ func (h *RegistryHandler) remove(name string) (RegistryResponse, error) {
 	if len(kept) == original {
 		return RegistryResponse{Changed: false}, fmt.Errorf("skill %q 不存在", name)
 	}
-
 	rf.Services.Tools = kept
 	if err := h.save(rf); err != nil {
 		return RegistryResponse{}, err
@@ -200,16 +204,13 @@ func (h *RegistryHandler) update(p RegistryRequest) (RegistryResponse, error) {
 	if target == "" {
 		return RegistryResponse{}, fmt.Errorf("需要指定 name 或 tool.name")
 	}
-
 	rf, err := h.load()
 	if err != nil {
 		return RegistryResponse{}, err
 	}
-
 	found := false
 	for i, t := range rf.Services.Tools {
 		if t.Name == target {
-			// 只更新非零字段
 			if p.Tool.Addr != "" {
 				rf.Services.Tools[i].Addr = p.Tool.Addr
 			}
@@ -229,19 +230,16 @@ func (h *RegistryHandler) update(p RegistryRequest) (RegistryResponse, error) {
 	if !found {
 		return RegistryResponse{Changed: false}, fmt.Errorf("skill %q 不存在", target)
 	}
-
 	if err := h.save(rf); err != nil {
 		return RegistryResponse{}, err
 	}
 	return RegistryResponse{Changed: true, Tools: rf.Services.Tools}, nil
 }
 
-// ── port probe ───────────────────────────────────────────────────────────────
+// ── port probe（不变）───────────────────────────────────────────────────────
 
-// waitPort 轮询直到 addr 的 TCP 端口可达或超时
 func waitPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	// 确保 addr 有端口
 	if !strings.Contains(addr, ":") {
 		return fmt.Errorf("addr 格式错误，需要 host:port")
 	}
@@ -256,16 +254,6 @@ func waitPort(addr string, timeout time.Duration) error {
 	return fmt.Errorf("超时 %s 后端口仍不可达", timeout)
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-func errResp(name, msg string) ([]*pb.ToolResponse, error) {
-	resp, err := tool.NewOKResp(name, RegistryResponse{Error: msg})
-	if err != nil {
-		return nil, err
-	}
-	return []*pb.ToolResponse{resp}, nil
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -275,5 +263,8 @@ func main() {
 	}
 	registryPath = filepath.Clean(registryPath)
 
-	tool.New(&RegistryHandler{registryPath: registryPath}).Serve(":50105")
+	log.Println("[registry] 启动，监听 :50105")
+	if err := tool.New(&RegistryHandler{registryPath: registryPath}).Serve(":50105"); err != nil {
+		log.Fatalf("[registry] %v", err)
+	}
 }

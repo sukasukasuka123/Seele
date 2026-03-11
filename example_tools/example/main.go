@@ -1,6 +1,3 @@
-// micro_tool/example/main.go
-// [TEST SKILL] echo —— 原样返回输入
-// 用途：验证 microHub → agentfactory → Agent 整条调用链
 package main
 
 import (
@@ -8,50 +5,47 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/sukasukasuka123/microHub/pb_api"
 	pb "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	tool "github.com/sukasukasuka123/microHub/root_class/tool"
 )
 
-// EchoRequest 对应 registry.yaml input_schema
 type EchoRequest struct {
-	Content string `json:"content"`
+	Message string `json:"message"`
 }
 
-// EchoResponse 对应 registry.yaml output_schema
 type EchoResponse struct {
-	Content string `json:"content"`
+	Echo string `json:"echo"`
 }
 
 type EchoHandler struct{}
 
 func (h *EchoHandler) ServiceName() string { return "echo" }
 
-func (h *EchoHandler) Execute(req *pb.ToolRequest) ([]*pb.ToolResponse, error) {
-	// 解析参数：[]byte → struct
-	var params EchoRequest
-	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return nil, fmt.Errorf("parse params: %w", err)
+func (h *EchoHandler) Execute(req *pb.ToolRequest) (<-chan *pb.ToolResponse, error) {
+	var p EchoRequest
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return nil, fmt.Errorf("echo: parse params: %w", err)
+	}
+
+	ch := make(chan *pb.ToolResponse, 1)
+	go func() {
+		defer close(ch)
+
+		resp, err := pb_api.OKResp("echo", req.TaskId, EchoResponse{Echo: p.Message})
+		if err != nil {
+			ch <- pb_api.ErrorResp("echo", req.TaskId, "BUILD_RESP", err.Error(), "")
+			return
 		}
-	}
-	if params.Content == "" {
-		params.Content = "(empty)"
-	}
-
-	resp, err := tool.NewOKResp(h.ServiceName(), EchoResponse{
-		Content: params.Content,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("[echo] content=%q\n", params.Content)
-	return []*pb.ToolResponse{resp}, nil
+		ch <- resp
+		fmt.Printf("[echo] task=%s message=%q\n", req.TaskId, p.Message)
+	}()
+	return ch, nil
 }
 
 func main() {
-	log.Println("[echo] TEST SKILL 启动，监听 :50101")
+	log.Println("[echo] 启动，监听 :50101")
 	if err := tool.New(&EchoHandler{}).Serve(":50101"); err != nil {
-		log.Fatalf("%v", err)
+		log.Fatalf("[echo] %v", err)
 	}
 }

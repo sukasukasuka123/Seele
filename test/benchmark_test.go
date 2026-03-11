@@ -1,21 +1,16 @@
 // test/benchmark_test.go
-
 package test
 
 import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	agentfactory "github.com/sukasukasuka123/Seele"
-
 	hubbase "github.com/sukasukasuka123/microHub/root_class/hub"
 )
 
-// ── Benchmark 公共基础设施 ──────────────────────────────────────
-
-// newBenchFactory 创建用于 benchmark 的 Factory（使用 mockLLM，不消耗真实 API）
+// newBenchFactory 创建用于 benchmark 的 Factory（mockLLM，不消耗真实 API）
 func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfactory.Message) *agentfactory.Factory {
 	b.Helper()
 	mock := newMockLLM(respond)
@@ -26,7 +21,7 @@ func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfac
 		BaseURL: mock.baseURL(),
 		APIKey:  "bench-key",
 		Model:   "bench-model",
-		Timeout: 5 * time.Second,
+		Timeout: 5,
 	}, hub)
 	if err != nil {
 		b.Fatalf("NewFactory: %v", err)
@@ -34,7 +29,6 @@ func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfac
 	return f
 }
 
-// plainResponder 返回一个永远回复纯文本的 LLM mock（不触发 tool_call）
 func plainResponder(content string) func([]agentfactory.Message) agentfactory.Message {
 	return func(_ []agentfactory.Message) agentfactory.Message {
 		return agentfactory.Message{Role: "assistant", Content: content}
@@ -43,7 +37,6 @@ func plainResponder(content string) func([]agentfactory.Message) agentfactory.Me
 
 // ── Factory benchmarks ──────────────────────────────────────────
 
-// BenchmarkFactory_New 衡量创建 Agent 的开销
 func BenchmarkFactory_New(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	b.ResetTimer()
@@ -52,7 +45,6 @@ func BenchmarkFactory_New(b *testing.B) {
 	}
 }
 
-// BenchmarkFactory_New_Parallel 衡量并发创建 Agent 时 Factory 的竞争情况
 func BenchmarkFactory_New_Parallel(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	b.RunParallel(func(pb *testing.PB) {
@@ -62,9 +54,6 @@ func BenchmarkFactory_New_Parallel(b *testing.B) {
 	})
 }
 
-// BenchmarkFactory_Skills 衡量列举 skill 的开销（从 registry 读取 + retired 过滤）
-// skill 列表来自 registry，数量取决于 registry.yaml；若无 registry 则为空列表，
-// 仍可测试锁争用和 slice 分配开销。
 func BenchmarkFactory_Skills(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	b.ResetTimer()
@@ -73,19 +62,16 @@ func BenchmarkFactory_Skills(b *testing.B) {
 	}
 }
 
-// BenchmarkFactory_RetireRestore 衡量 Retire/Restore 的锁开销
-// skill 名称不必在 registry 中真实存在，Retire/Restore 只操作 retired map。
 func BenchmarkFactory_RetireRestore(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		name := fmt.Sprintf("skill_%d", i%16) // 16 个 slot 循环，模拟真实场景
+		name := fmt.Sprintf("skill_%d", i%16)
 		f.Retire(name)
 		f.Restore(name)
 	}
 }
 
-// BenchmarkFactory_RetireRestore_Parallel 衡量并发 Retire/Restore 的 mutex 性能
 func BenchmarkFactory_RetireRestore_Parallel(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	b.RunParallel(func(pb *testing.PB) {
@@ -101,7 +87,7 @@ func BenchmarkFactory_RetireRestore_Parallel(b *testing.B) {
 
 // ── Agent Chat benchmarks ───────────────────────────────────────
 
-// BenchmarkAgent_Chat_SingleTurn 衡量单轮对话的端到端延迟（本地 mock，无网络）
+// BenchmarkAgent_Chat_SingleTurn 单轮对话端到端延迟（本地 mock，无网络）
 func BenchmarkAgent_Chat_SingleTurn(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("这是回复"))
 	a := f.New("你是助手")
@@ -113,11 +99,11 @@ func BenchmarkAgent_Chat_SingleTurn(b *testing.B) {
 		if err != nil || reply == "" {
 			b.Fatalf("Chat failed: err=%v reply=%q", err, reply)
 		}
-		a.Reset(true)
+		a.ClearHistory() // 对应旧版 Reset(true)，保留 system 消息
 	}
 }
 
-// BenchmarkAgent_Chat_Parallel 衡量多个独立 Agent 并发 Chat 的吞吐量
+// BenchmarkAgent_Chat_Parallel 多个独立 Agent 并发 Chat 吞吐量
 func BenchmarkAgent_Chat_Parallel(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("ok"))
 	ctx := context.Background()
@@ -130,18 +116,17 @@ func BenchmarkAgent_Chat_Parallel(b *testing.B) {
 			if err != nil || reply == "" {
 				b.Errorf("Chat failed: %v", err)
 			}
-			a.Reset(true)
+			a.ClearHistory()
 		}
 	})
 }
 
-// BenchmarkAgent_Chat_LongHistory 衡量携带较长历史时单次 Chat 的开销
+// BenchmarkAgent_Chat_LongHistory 携带较长历史时单次 Chat 的开销
 func BenchmarkAgent_Chat_LongHistory(b *testing.B) {
 	f := newBenchFactory(b, plainResponder("回复"))
 	ctx := context.Background()
 
-	// 预热：构造 historyDepth 轮历史后固定住
-	const historyDepth = 18 // 不超过 truncate keep=20，避免截断干扰
+	const historyDepth = 18
 	base := f.New("system")
 	for i := 0; i < historyDepth; i++ {
 		_, _ = base.Chat(ctx, fmt.Sprintf("预热消息%d", i))
@@ -150,8 +135,7 @@ func BenchmarkAgent_Chat_LongHistory(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = base.Chat(ctx, "bench消息")
-		// 截断到固定深度，保持 bench 条件稳定
-		base.Reset(true)
+		base.ClearHistory()
 		for j := 0; j < historyDepth; j++ {
 			_, _ = base.Chat(ctx, fmt.Sprintf("恢复消息%d", j))
 		}

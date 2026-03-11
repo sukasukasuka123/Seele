@@ -1,15 +1,3 @@
-// cmd/main.go
-//
-// suka-eva 交互式入口
-//
-// 启动流程：
-//  1. api.New() — 加载 registry、启动 Hub、创建 Factory（一行完成）
-//  2. cli.New() — 创建 REPL，注入 system prompt 和可选钩子
-//  3. repl.Run() — 进入交互循环
-//
-// 所有样板代码（Hub 路由、registry 初始化、Factory 构建、命令解析）
-// 均已下沉到 sdk/api 和 sdk/cli，main 只负责配置拼接。
-
 package main
 
 import (
@@ -24,17 +12,17 @@ import (
 )
 
 const (
-	registryPath  = "config_example/registry.yaml"
-	llmConfigPath = "config_example/config.yaml"
+	registryPath  = "config/registry.yaml"
+	llmConfigPath = "config/config.yaml"
 	hubAddr       = ":50051"
 
-	systemPrompt = "你是 suka-eva，一个通过微服务架构动态扩展 skill 的 AI 助手。" +
+	systemPrompt = "你是 Seele，一个通过微服务架构动态扩展 skill 的 AI 助手。" +
 		"你的每个 skill 都运行在独立的 gRPC 微服务进程里，通过 microHub 调度执行。" +
 		"请回答用户的问题，需要时主动调用合适的 skill。"
 )
 
 func main() {
-	// ── 1. 初始化引擎（registry + Hub + Factory 一步到位）────────────────
+	// 1. 初始化引擎（registry + Hub + Factory 一步到位）
 	engine, err := api.New(api.Options{
 		RegistryPath:  registryPath,
 		LLMConfigPath: llmConfigPath,
@@ -45,16 +33,14 @@ func main() {
 	}
 	defer engine.Shutdown()
 
-	// ── 2. 创建 REPL ─────────────────────────────────────────────────────
-	repl := cli.New(engine, cli.Options{
-		SystemPrompt: systemPrompt,
-		BotName:      "eva",
-	})
-
-	// ── 3. 监听退出信号，优雅关闭 ────────────────────────────────────────
+	// 2. 监听退出信号
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// ── 4. 启动交互循环（阻塞直到 quit 或 Ctrl-C）────────────────────────
-	repl.Run(ctx)
+	// 3. 启动 REPL（阻塞直到 exit 或 Ctrl-C）
+	cli.RunREPL(ctx, cli.REPLOptions{
+		Engine:       engine,
+		SystemPrompt: systemPrompt,
+		Prompt:       "seele> ",
+	})
 }

@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
+	"time"
 )
 
-// Agent 是一个独立的对话实体，持有私有的对话历史。
-// 通过 [Factory.New] 创建；所有 Agent 共用 Factory 中注册的工具链。
+// Agent 是绑定到单个会话的智能体实例。
 //
-// Agent 非并发安全——同一个 Agent 实例请勿跨 goroutine 并发调用 Chat。
-// 需要并发时，为每个 goroutine 创建独立的 Agent 实例即可。
+// 每个 Agent 拥有：
+//   - 独立的对话历史（history）
+//   - 唯一的会话 ID（sessionID）
+//   - tool_call 循环上限（maxLoops，默认 8）
+//
+// 并发安全性：Agent 本身不加锁，同一个 Agent 不应跨 goroutine 并发调用。
+// 如需并发，请通过 Factory.New() 各自创建独立 Agent。
 type Agent struct {
 	factory   *Factory
 	sessionID string
@@ -19,77 +23,9 @@ type Agent struct {
 	maxLoops  int
 }
 
-// Chat 发送一条用户消息，返回 Agent 的最终文本回复。
-//
-// 内部会自动处理多轮 tool_call → tool_result 循环，直到 LLM 给出纯文本回复
-// 或达到最大循环次数（默认 8）。
-func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
-	a.history = append(a.history, Message{Role: "user", Content: userInput})
-
-	tools := a.factory.tools() // 每轮拉取最新列表，支持热注册/下线
-
-	for loop := 0; loop < a.maxLoops; loop++ {
-		msg, err := a.factory.llm.chat(a.history, tools)
-		if err != nil {
-			return "", fmt.Errorf("llm: %w", err)
-		}
-
-		a.history = append(a.history, msg)
-
-		// 无工具调用 → 直接返回
-		if len(msg.ToolCalls) == 0 {
-			a.history = truncate(a.history)
-			return msg.Content, nil
-		}
-
-		log.Printf("[Agent %s] loop %d: %d tool call(s)", a.sessionID, loop+1, len(msg.ToolCalls))
-
-		// 并行执行所有 tool_call（按 OpenAI 规范，同一批次可并行）
-		results := make([]Message, len(msg.ToolCalls))
-		for i, tc := range msg.ToolCalls {
-			result, dispatchErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-			toolMsg := Message{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-			}
-			if dispatchErr != nil {
-				toolMsg.Content = fmt.Sprintf(`{"error":%q}`, dispatchErr.Error())
-				log.Printf("[Agent %s] skill %s error: %v", a.sessionID, tc.Function.Name, dispatchErr)
-			} else {
-				toolMsg.Content = result
-				log.Printf("[Agent %s] skill %s ok", a.sessionID, tc.Function.Name)
-			}
-			results[i] = toolMsg
-		}
-		a.history = append(a.history, results...)
-
-		// 刷新工具列表（可能在执行期间有新 skill 注册）
-		tools = a.factory.tools()
-	}
-
-	log.Printf("[Agent %s] max loops (%d) reached", a.sessionID, a.maxLoops)
-	return "抱歉，处理过程过于复杂，已达到最大尝试次数。请简化问题或分步询问。", nil
-}
-
-// SetSystem 设置或替换 system prompt。
-// 如果历史中已有 system 消息，直接替换；否则插到最前面。
-func (a *Agent) SetSystem(prompt string) {
-	msg := Message{Role: "system", Content: prompt}
-	if len(a.history) > 0 && a.history[0].Role == "system" {
-		a.history[0] = msg
-	} else {
-		a.history = append([]Message{msg}, a.history...)
-	}
-}
-
-// Reset 清空对话历史。keepSystem=true 时保留 system prompt。
-func (a *Agent) Reset(keepSystem bool) {
-	if keepSystem && len(a.history) > 0 && a.history[0].Role == "system" {
-		a.history = []Message{a.history[0]}
-	} else {
-		a.history = nil
-	}
+// SessionID 返回本 Agent 的唯一会话标识符。
+func (a *Agent) SessionID() string {
+	return a.sessionID
 }
 
 // History 返回当前对话历史的只读副本。
@@ -99,35 +35,89 @@ func (a *Agent) History() []Message {
 	return cp
 }
 
-// SessionID 返回本 Agent 的唯一会话 ID。
-func (a *Agent) SessionID() string { return a.sessionID }
-
-// SetMaxLoops 设置 tool_call 循环上限（默认 8）。
-func (a *Agent) SetMaxLoops(n int) { a.maxLoops = n }
-
-// ── 内部工具 ────────────────────────────────────────────────────
-
-// truncate 保留 system prompt + 最近 20 条消息，防止 context 爆炸。
-// TODO: 接入 tiktoken 做精确 token 计数。
-func truncate(msgs []Message) []Message {
-	const keep = 20
-	if len(msgs) <= keep {
-		return msgs
-	}
+// ClearHistory 清空对话历史，但保留 system 消息（如有）。
+func (a *Agent) ClearHistory() {
 	var sys []Message
-	if msgs[0].Role == "system" {
-		sys = msgs[:1]
-		msgs = msgs[1:]
+	for _, m := range a.history {
+		if m.Role == "system" {
+			sys = append(sys, m)
+		}
 	}
-	if len(msgs) > keep {
-		msgs = msgs[len(msgs)-keep:]
-	}
-	return append(sys, msgs...)
+	a.history = sys
 }
 
-// Summary 返回对话摘要字符串（调试 / 日志用）。
-func (a *Agent) Summary() string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Agent{session=%s messages=%d}", a.sessionID, len(a.history))
-	return sb.String()
+// SetMaxLoops 设置单次 Chat 调用中最多允许的 tool_call 循环次数。
+// 默认值为 8；设置过大可能导致长时间阻塞。
+func (a *Agent) SetMaxLoops(n int) {
+	if n > 0 {
+		a.maxLoops = n
+	}
+}
+
+// Chat 追加 userInput 消息，驱动 LLM 推理并自动执行 tool_calls，
+// 直至 LLM 返回纯文本回复或达到 maxLoops 上限。
+//
+// 循环流程：
+//  1. 调用 LLM（携带完整历史 + 当前可用工具列表）
+//  2. 若回复含 tool_calls → 依次 dispatch → 结果追加为 tool 消息
+//  3. 重新调用 LLM（携带工具结果）
+//  4. 重复直到没有 tool_calls 或达到 maxLoops
+//
+// 每轮开始前都会实时读取 registry 刷新工具列表，支持热更新。
+func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
+	if userInput != "" {
+		a.history = append(a.history, Message{Role: "user", Content: userInput})
+	}
+
+	tools := a.factory.tools()
+
+	for loop := 0; loop < a.maxLoops; loop++ {
+		msg, err := a.factory.llm.complete(ctx, a.history, tools)
+		if err != nil {
+			return "", fmt.Errorf("agent[%s] chat loop %d: %w", a.sessionID, loop, err)
+		}
+
+		// 将 assistant 回复追加到历史
+		a.history = append(a.history, Message{
+			Role:      "assistant",
+			Content:   msg.Content,
+			ToolCalls: msg.ToolCalls,
+		})
+
+		// 没有 tool_calls → 直接返回文本回复
+		if len(msg.ToolCalls) == 0 {
+			return msg.Content, nil
+		}
+
+		// 依次执行每个 tool_call
+		for _, tc := range msg.ToolCalls {
+			start := time.Now()
+			result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+			elapsed := time.Since(start).Milliseconds()
+
+			var toolContent string
+			if dispErr != nil {
+				log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
+					a.sessionID, tc.Function.Name, elapsed, dispErr)
+				toolContent = fmt.Sprintf(`{"error":%q}`, dispErr.Error())
+			} else {
+				log.Printf("[Agent %s] tool_call %s OK (%dms)",
+					a.sessionID, tc.Function.Name, elapsed)
+				toolContent = result
+			}
+
+			a.history = append(a.history, Message{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Name:       tc.Function.Name,
+				Content:    toolContent,
+			})
+		}
+
+		// 刷新工具列表（registry 支持热更新）
+		tools = a.factory.tools()
+	}
+
+	return "", fmt.Errorf("agent[%s]: reached maxLoops (%d) without a final text reply",
+		a.sessionID, a.maxLoops)
 }
