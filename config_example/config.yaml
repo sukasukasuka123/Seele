@@ -6,4 +6,4 @@ agent:
   ai_name: "qwen3.5-plus"
 
     # API Key（集成测试时替换为真实值，不要提交到版本控制）
-  ai_api_key: "sk-xxxxxxxxxxxxxxxxxxx"
+  ai_api_key: "xxxxxxxxxxx"
