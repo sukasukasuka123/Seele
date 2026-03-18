@@ -1,9 +1,0 @@
-agent:
-  # config_example/config.yaml
-  ai_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-    # 模型名称，需与服务商一致
-  ai_name: "qwen3.5-plus"
-
-    # API Key（集成测试时替换为真实值，不要提交到版本控制）
-  ai_api_key: "xxxxxxxxxxx"

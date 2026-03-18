@@ -62,20 +62,21 @@ type SkillInfo struct {
 
 // AppConfig 是整个 Seele 应用的配置，对应 config.yaml 顶层结构。
 // 通过 LoadConfig 加载；部分字段可由环境变量覆盖（见 config.go）。
+// AppConfig 顶层对应 config.yaml 的根结构。
 type AppConfig struct {
-	LLM      LLMConfig      `yaml:"llm"`
+	LLM      LLMConfig      `yaml:"agent"` // yaml 顶层 key 是 agent
 	Hub      HubConfig      `yaml:"hub"`
 	Registry RegistryConfig `yaml:"registry"`
 }
 
-// LLMConfig 是 LLM 服务的连接配置。
+// LLMConfig 对应 config.yaml 的 agent 块。
 type LLMConfig struct {
-	BaseURL     string  `yaml:"base_url"`    // 如 https://api.openai.com/v1
-	APIKey      string  `yaml:"api_key"`     // Bearer token
-	Model       string  `yaml:"model"`       // 如 gpt-4o、deepseek-chat
-	MaxTokens   int     `yaml:"max_tokens"`  // 0 表示不传（由模型决定）
-	Timeout     int     `yaml:"timeout"`     // HTTP 超时秒数，0 时内部默认 60
-	Temperature float64 `yaml:"temperature"` // 0.0–2.0，0 时内部默认 1.0
+	BaseURL     string  `yaml:"ai_url"`     // agent.ai_url
+	APIKey      string  `yaml:"ai_api_key"` // agent.ai_api_key
+	Model       string  `yaml:"ai_name"`    // agent.ai_name
+	MaxTokens   int     `yaml:"max_tokens"`
+	Timeout     int     `yaml:"timeout"`
+	Temperature float64 `yaml:"temperature"`
 }
 
 // HubConfig 是 microHub 的连接配置。

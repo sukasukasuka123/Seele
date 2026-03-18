@@ -42,5 +42,6 @@ func main() {
 		Engine:       engine,
 		SystemPrompt: systemPrompt,
 		Prompt:       "seele> ",
+		Stream:       true,
 	})
 }
