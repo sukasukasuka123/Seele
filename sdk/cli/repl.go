@@ -1,5 +1,3 @@
-// Package cli 提供 Seele 命令行工具的辅助函数。
-// 封装常见的 REPL、批处理和 one-shot 查询模式。
 package cli
 
 import (
@@ -20,6 +18,7 @@ type REPLOptions struct {
 	Engine       *api.Engine // 必填
 	Output       io.Writer   // 输出目标，默认 os.Stdout
 	Input        io.Reader   // 输入源，默认 os.Stdin
+	Stream       bool        // true 时使用流式输出，默认 false
 }
 
 // RunREPL 启动交互式 REPL，直到 ctx 取消、输入结束或用户输入 exit/quit。
@@ -59,6 +58,7 @@ func RunREPL(ctx context.Context, opts REPLOptions) {
 		}
 
 		line := strings.TrimSpace(scanner.Text())
+		var err error
 		switch line {
 		case "", "exit", "quit":
 			fmt.Fprintln(out, "Bye.")
@@ -73,11 +73,20 @@ func RunREPL(ctx context.Context, opts REPLOptions) {
 			agent.ClearHistory()
 			fmt.Fprintln(out, "[历史已清空]")
 		default:
-			reply, err := agent.Chat(ctx, line)
+			if opts.Stream {
+				_, err = agent.ChatStream(ctx, line, func(delta string) {
+					fmt.Fprint(out, delta)
+				})
+				fmt.Fprintln(out) // 流结束后补换行
+			} else {
+				var reply string
+				reply, err = agent.Chat(ctx, line)
+				if err == nil {
+					fmt.Fprintln(out, reply)
+				}
+			}
 			if err != nil {
 				fmt.Fprintf(out, "[错误] %v\n", err)
-			} else {
-				fmt.Fprintln(out, reply)
 			}
 		}
 		fmt.Fprint(out, opts.Prompt)
@@ -88,4 +97,13 @@ func RunREPL(ctx context.Context, opts REPLOptions) {
 // 适合脚本或管道场景。
 func OneShot(ctx context.Context, engine *api.Engine, systemPrompt, userInput string) (string, error) {
 	return engine.QuickChat(ctx, systemPrompt, userInput)
+}
+
+// OneShotStream 创建临时 Agent，执行单次流式对话。
+// onChunk 为 nil 时默认直接打印到 stdout。
+func OneShotStream(ctx context.Context, engine *api.Engine, systemPrompt, userInput string, onChunk func(string)) (string, error) {
+	if onChunk == nil {
+		onChunk = func(delta string) { fmt.Print(delta) }
+	}
+	return engine.QuickChatStream(ctx, systemPrompt, userInput, onChunk)
 }

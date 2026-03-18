@@ -189,6 +189,13 @@ func (e *Engine) QuickChat(ctx context.Context, systemPrompt, userInput string) 
 	return a.Chat(ctx, userInput)
 }
 
+// QuickChatStream 创建临时 Agent，发送一条消息并流式返回回复，不保留历史。
+// 适合一次性流式调用场景。
+func (e *Engine) QuickChatStream(ctx context.Context, systemPrompt, userInput string, onChunk func(delta string)) (string, error) {
+	a := e.NewAgent(systemPrompt)
+	return a.ChatStream(ctx, userInput, onChunk)
+}
+
 // ── AgentPool ─────────────────────────────────────────────────────────────────
 
 // AgentPool 管理一组具名 Agent，支持按名称切换。
@@ -280,6 +287,16 @@ func (p *AgentPool) Chat(ctx context.Context, input string) (string, error) {
 		return "", fmt.Errorf("agentpool is empty, call Add first")
 	}
 	return a.Chat(ctx, input)
+}
+
+// ChatStream 向当前活跃 Agent 发起流式对话。
+// onChunk 在每个文本 delta 到达时同步调用；tool_call 轮次不触发 onChunk。
+func (p *AgentPool) ChatStream(ctx context.Context, input string, onChunk func(delta string)) (string, error) {
+	a := p.Current()
+	if a == nil {
+		return "", fmt.Errorf("agentpool is empty, call Add first")
+	}
+	return a.ChatStream(ctx, input, onChunk)
 }
 
 // ── Hub 路由（SDK 内部使用）───────────────────────────────────────────────────

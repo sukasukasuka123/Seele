@@ -1,6 +1,6 @@
 module github.com/sukasukasuka123/Seele
 
-go 1.24.0
+go 1.25
 
 require (
 	github.com/spf13/viper v1.21.0

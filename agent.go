@@ -121,3 +121,81 @@ func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
 	return "", fmt.Errorf("agent[%s]: reached maxLoops (%d) without a final text reply",
 		a.sessionID, a.maxLoops)
 }
+
+// ChatStream 与 Chat 行为完全一致，但最终的文本回复改为流式推送。
+//
+// 流程：
+//   - tool_call 轮次：走非流式 complete（LLM 必须返回完整 JSON 才能 dispatch）
+//   - 最终文本轮次：走流式 completeStream，每个 delta 同步调用 onChunk
+//
+// onChunk 在 LLM 推送每个文本 token 时被同步调用；
+// 所有 chunk 拼接即完整回复，也作为返回值返回（同时追加进 history）。
+func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(delta string)) (string, error) {
+	if userInput != "" {
+		a.history = append(a.history, Message{Role: "user", Content: userInput})
+	}
+
+	tools := a.factory.tools()
+
+	for loop := 0; loop < a.maxLoops; loop++ {
+		// ── 先用非流式判断是否有 tool_calls ──────────────────────────
+		// tool_calls 的 JSON 必须完整才能 dispatch，流式逐帧拼接虽可行但
+		// 复杂度高；此处采用"tool_call 轮非流式，最终文本轮流式"策略，
+		// 保持代码清晰，代价是 tool_call 轮不产生流式输出（本就无需展示）。
+		msg, err := a.factory.llm.complete(ctx, a.history, tools)
+		if err != nil {
+			return "", fmt.Errorf("agent[%s] stream loop %d: %w", a.sessionID, loop, err)
+		}
+
+		// ── 无 tool_calls → 这是最终回复轮，改用流式重新请求 ──────────
+		if len(msg.ToolCalls) == 0 {
+			// 丢弃上面的非流式结果，用流式重发相同的 history 获取 token 流。
+			// history 此时尚未追加 assistant 消息，因此重发内容与上次完全一致。
+			fullContent, _, streamErr := a.factory.llm.completeStream(ctx, a.history, tools, onChunk)
+			if streamErr != nil {
+				return "", fmt.Errorf("agent[%s] final stream loop %d: %w", a.sessionID, loop, streamErr)
+			}
+			a.history = append(a.history, Message{
+				Role:    "assistant",
+				Content: fullContent,
+			})
+			return fullContent, nil
+		}
+
+		// ── 有 tool_calls → 追加历史，依次 dispatch ───────────────────
+		a.history = append(a.history, Message{
+			Role:      "assistant",
+			Content:   msg.Content,
+			ToolCalls: msg.ToolCalls,
+		})
+
+		for _, tc := range msg.ToolCalls {
+			start := time.Now()
+			result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+			elapsed := time.Since(start).Milliseconds()
+
+			var toolContent string
+			if dispErr != nil {
+				log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
+					a.sessionID, tc.Function.Name, elapsed, dispErr)
+				toolContent = fmt.Sprintf(`{"error":%q}`, dispErr.Error())
+			} else {
+				log.Printf("[Agent %s] tool_call %s OK (%dms)",
+					a.sessionID, tc.Function.Name, elapsed)
+				toolContent = result
+			}
+
+			a.history = append(a.history, Message{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Name:       tc.Function.Name,
+				Content:    toolContent,
+			})
+		}
+
+		tools = a.factory.tools()
+	}
+
+	return "", fmt.Errorf("agent[%s]: reached maxLoops (%d) without a final text reply",
+		a.sessionID, a.maxLoops)
+}
