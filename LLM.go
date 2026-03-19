@@ -157,7 +157,6 @@ type chatCompletionStreamResponse struct {
 }
 
 // ── completeStream ────────────────────────────────────────────────
-
 // completeStream 发起流式 chat completion 请求。
 //
 // 行为规则（与 OpenAI 流式协议对齐）：
@@ -167,13 +166,10 @@ type chatCompletionStreamResponse struct {
 //     返回 ("", toolCalls, nil)
 //
 // 调用方无需区分两种情况，只需检查返回的 toolCalls 是否为空。
-func (c *llmClient) completeStream(
-	ctx context.Context,
-	messages []Message,
-	tools []Tool,
-	onChunk func(delta string),
-) (content string, toolCalls []ToolCall, err error) {
 
+// doStreamRequest 构造并发送流式 HTTP 请求，返回响应 body。
+// 调用方负责关闭 body。
+func (c *llmClient) doStreamRequest(ctx context.Context, messages []Message, tools []Tool) (io.ReadCloser, error) {
 	temperature := c.cfg.Temperature
 	if temperature == 0 {
 		temperature = 1.0
@@ -192,16 +188,13 @@ func (c *llmClient) completeStream(
 
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", nil, fmt.Errorf("llmClient stream: marshal: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(
-		ctx, http.MethodPost,
-		c.cfg.BaseURL+"/chat/completions",
-		bytes.NewReader(raw),
-	)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return "", nil, fmt.Errorf("llmClient stream: build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
@@ -209,97 +202,161 @@ func (c *llmClient) completeStream(
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return "", nil, fmt.Errorf("llmClient stream: HTTP: %w", err)
+		return nil, fmt.Errorf("HTTP: %w", err)
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("llmClient stream: HTTP %d: %.512s", resp.StatusCode, body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("HTTP %d: %.512s", resp.StatusCode, body)
 	}
 
-	// tool_calls 累积表：index → 对应的 ToolCall（Arguments 逐帧拼接）
-	tcMap := make(map[int]*ToolCall)
-	var sb strings.Builder
-	isToolMode := false
+	return resp.Body, nil
+}
 
-	reader := bufio.NewReader(resp.Body)
+// sseState 保存 SSE 读取过程中的累积状态。
+// 每次 completeStream 调用创建一个新实例，不跨请求复用。
+type sseState struct {
+	// tcMap 以 tool_call 的 index 为 key，累积每个工具调用的完整内容。
+	// LLM 会把 arguments JSON 拆成多帧推送，这里负责把碎片拼回完整 JSON。
+	tcMap map[int]*ToolCall
+
+	// sb 累积纯文本回复，每个文本 delta 追加进来。
+	sb strings.Builder
+
+	// isToolMode 标记当前流是否为 tool_call 模式。
+	// 一旦收到第一个 tool_call 帧就锁定为 true，不可逆。
+	// 锁定后忽略所有文本帧（正常情况下也不会再有文本帧）。
+	isToolMode bool
+}
+
+func newSSEState() *sseState {
+	return &sseState{
+		tcMap: make(map[int]*ToolCall),
+	}
+}
+
+// processFrame 解析单个 SSE data 帧的 JSON payload，更新 sseState。
+//
+// 两种帧：
+//   - tool_call 帧：delta.ToolCalls 非空，累积进 tcMap，不调用 onChunk
+//   - 文本帧：delta.Content 非空，追加进 sb，并调用 onChunk 实时推给调用方
+//
+// 返回 error 时调用方应中止整个流。
+func (c *llmClient) processFrame(payload string, state *sseState, onChunk func(string)) error {
+	var frame chatCompletionStreamResponse
+	if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+		// 无法解析的帧直接跳过，不中断流。
+		// 常见于心跳帧或格式略有差异的中间帧。
+		return nil
+	}
+	if frame.Error != nil {
+		return fmt.Errorf("API error [%s/%s]: %s",
+			frame.Error.Type, frame.Error.Code, frame.Error.Message)
+	}
+	if len(frame.Choices) == 0 {
+		return nil
+	}
+
+	delta := frame.Choices[0].Delta
+
+	// ── tool_call 帧处理 ──────────────────────────────────────────
+	// LLM 返回 tool_call 时，同一个工具的内容分散在多帧里：
+	//   首帧：携带 id、函数名，arguments 为空字符串
+	//   后续帧：只有 arguments 的 JSON 碎片，逐帧拼接才能得到完整参数
+	if len(delta.ToolCalls) > 0 {
+		state.isToolMode = true
+		for _, tc := range delta.ToolCalls {
+			entry, exists := state.tcMap[tc.Index]
+			if !exists {
+				entry = &ToolCall{Type: "function"}
+				state.tcMap[tc.Index] = entry
+			}
+			if tc.ID != "" {
+				entry.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				entry.Function.Name = tc.Function.Name
+			}
+			entry.Function.Arguments += tc.Function.Arguments
+		}
+	}
+
+	// ── 文本帧处理 ────────────────────────────────────────────────
+	// isToolMode 时不处理文本帧，正常流里两种帧不会混出现。
+	if !state.isToolMode && delta.Content != "" {
+		state.sb.WriteString(delta.Content)
+		onChunk(delta.Content) // 实时推给调用方，用户立刻看到这个 token
+	}
+
+	return nil
+}
+
+// buildToolCalls 将 tcMap（index → *ToolCall）整理成有序的 []ToolCall。
+// LLM 保证 index 从 0 连续递增，直接用 index 作为 slice 下标写入。
+func buildToolCalls(tcMap map[int]*ToolCall) []ToolCall {
+	result := make([]ToolCall, len(tcMap))
+	for idx, tc := range tcMap {
+		if idx < len(result) {
+			result[idx] = *tc
+		}
+	}
+	return result
+}
+
+// completeStream 发起流式 chat completion 请求。
+//
+// 行为：
+//   - 纯文本回复：每个 token 到达时调用 onChunk 实时推出，返回 (完整文本, nil, nil)
+//   - tool_call 回复：静默累积所有帧，返回 ("", toolCalls, nil)
+//
+// 调用方只需判断返回的 toolCalls 是否为空来区分两种情况。
+func (c *llmClient) completeStream(
+	ctx context.Context,
+	messages []Message,
+	tools []Tool,
+	onChunk func(delta string),
+) (content string, toolCalls []ToolCall, err error) {
+
+	// 1. 建立 SSE 连接
+	body, err := c.doStreamRequest(ctx, messages, tools)
+	if err != nil {
+		return "", nil, fmt.Errorf("llmClient stream: %w", err)
+	}
+	defer body.Close()
+
+	// 2. 逐行读取 SSE，解析每一帧
+	state := newSSEState()
+	reader := bufio.NewReader(body)
+
 	for {
 		line, readErr := reader.ReadString('\n')
 		line = strings.TrimRight(line, "\r\n")
 
-		switch {
-		case line == "data: [DONE]":
-			// 流结束
-			goto done
+		if line == "data: [DONE]" {
+			// 流正常结束
+			break
+		}
 
-		case strings.HasPrefix(line, "data: "):
+		if strings.HasPrefix(line, "data: ") {
 			payload := strings.TrimPrefix(line, "data: ")
-			if payload == "" {
-				break
-			}
-
-			var frame chatCompletionStreamResponse
-			if jsonErr := json.Unmarshal([]byte(payload), &frame); jsonErr != nil {
-				// 跳过无法解析的帧，不中断流
-				break
-			}
-			if frame.Error != nil {
-				return "", nil, fmt.Errorf("llmClient stream: API error [%s/%s]: %s",
-					frame.Error.Type, frame.Error.Code, frame.Error.Message)
-			}
-			if len(frame.Choices) == 0 {
-				break
-			}
-
-			delta := frame.Choices[0].Delta
-
-			// ── tool_calls 帧 ──────────────────────────────────────
-			if len(delta.ToolCalls) > 0 {
-				isToolMode = true
-				for _, tc := range delta.ToolCalls {
-					entry, exists := tcMap[tc.Index]
-					if !exists {
-						entry = &ToolCall{Type: "function"}
-						tcMap[tc.Index] = entry
-					}
-					// 首帧携带 ID 和函数名
-					if tc.ID != "" {
-						entry.ID = tc.ID
-					}
-					if tc.Function.Name != "" {
-						entry.Function.Name = tc.Function.Name
-					}
-					// Arguments 是流式 JSON 碎片，逐帧拼接
-					entry.Function.Arguments += tc.Function.Arguments
+			if payload != "" {
+				if err := c.processFrame(payload, state, onChunk); err != nil {
+					return "", nil, fmt.Errorf("llmClient stream: %w", err)
 				}
-			}
-
-			// ── 文本内容帧 ────────────────────────────────────────
-			if !isToolMode && delta.Content != "" {
-				sb.WriteString(delta.Content)
-				onChunk(delta.Content)
 			}
 		}
 
+		if readErr == io.EOF {
+			break
+		}
 		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
 			return "", nil, fmt.Errorf("llmClient stream: read SSE: %w", readErr)
 		}
 	}
 
-done:
-	if isToolMode {
-		// 按 index 顺序整理 tool_calls
-		result := make([]ToolCall, len(tcMap))
-		for idx, tc := range tcMap {
-			if idx < len(result) {
-				result[idx] = *tc
-			}
-		}
-		return "", result, nil
+	// 3. 根据模式返回结果
+	if state.isToolMode {
+		return "", buildToolCalls(state.tcMap), nil
 	}
-	return sb.String(), nil, nil
+	return state.sb.String(), nil, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -77,44 +78,53 @@ func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
 			return "", fmt.Errorf("agent[%s] chat loop %d: %w", a.sessionID, loop, err)
 		}
 
-		// 将 assistant 回复追加到历史
 		a.history = append(a.history, Message{
 			Role:      "assistant",
 			Content:   msg.Content,
 			ToolCalls: msg.ToolCalls,
 		})
 
-		// 没有 tool_calls → 直接返回文本回复
 		if len(msg.ToolCalls) == 0 {
 			return msg.Content, nil
 		}
 
-		// 依次执行每个 tool_call
-		for _, tc := range msg.ToolCalls {
-			start := time.Now()
-			result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-			elapsed := time.Since(start).Milliseconds()
+		type dispatchResult struct {
+			tc      ToolCall
+			content string
+		}
+		results := make([]dispatchResult, len(msg.ToolCalls))
 
-			var toolContent string
-			if dispErr != nil {
-				log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
-					a.sessionID, tc.Function.Name, elapsed, dispErr)
-				toolContent = fmt.Sprintf(`{"error":%q}`, dispErr.Error())
-			} else {
-				log.Printf("[Agent %s] tool_call %s OK (%dms)",
-					a.sessionID, tc.Function.Name, elapsed)
-				toolContent = result
-			}
+		var wg sync.WaitGroup
+		for i, tc := range msg.ToolCalls {
+			wg.Add(1)
+			go func(i int, tc ToolCall) {
+				defer wg.Done()
+				start := time.Now()
+				result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				elapsed := time.Since(start).Milliseconds()
 
+				if dispErr != nil {
+					log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
+						a.sessionID, tc.Function.Name, elapsed, dispErr)
+					results[i] = dispatchResult{tc, fmt.Sprintf(`{"error":%q}`, dispErr.Error())}
+				} else {
+					log.Printf("[Agent %s] tool_call %s OK (%dms)",
+						a.sessionID, tc.Function.Name, elapsed)
+					results[i] = dispatchResult{tc, result}
+				}
+			}(i, tc)
+		}
+		wg.Wait()
+
+		for _, r := range results {
 			a.history = append(a.history, Message{
 				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-				Content:    toolContent,
+				ToolCallID: r.tc.ID,
+				Name:       r.tc.Function.Name,
+				Content:    r.content,
 			})
 		}
 
-		// 刷新工具列表（registry 支持热更新）
 		tools = a.factory.tools()
 	}
 
@@ -138,23 +148,18 @@ func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(d
 	tools := a.factory.tools()
 
 	for loop := 0; loop < a.maxLoops; loop++ {
-		// ── 先用非流式判断是否有 tool_calls ──────────────────────────
-		// tool_calls 的 JSON 必须完整才能 dispatch，流式逐帧拼接虽可行但
-		// 复杂度高；此处采用"tool_call 轮非流式，最终文本轮流式"策略，
-		// 保持代码清晰，代价是 tool_call 轮不产生流式输出（本就无需展示）。
-		msg, err := a.factory.llm.complete(ctx, a.history, tools)
+		fullContent, toolCalls, err := a.factory.llm.completeStream(
+			ctx, a.history, tools,
+			func(delta string) {
+				onChunk(delta)
+			},
+		)
 		if err != nil {
 			return "", fmt.Errorf("agent[%s] stream loop %d: %w", a.sessionID, loop, err)
 		}
 
-		// ── 无 tool_calls → 这是最终回复轮，改用流式重新请求 ──────────
-		if len(msg.ToolCalls) == 0 {
-			// 丢弃上面的非流式结果，用流式重发相同的 history 获取 token 流。
-			// history 此时尚未追加 assistant 消息，因此重发内容与上次完全一致。
-			fullContent, _, streamErr := a.factory.llm.completeStream(ctx, a.history, tools, onChunk)
-			if streamErr != nil {
-				return "", fmt.Errorf("agent[%s] final stream loop %d: %w", a.sessionID, loop, streamErr)
-			}
+		// ── 无 tool_calls → 最终文本回复，流已经推完了 ───────────────
+		if len(toolCalls) == 0 {
 			a.history = append(a.history, Message{
 				Role:    "assistant",
 				Content: fullContent,
@@ -162,34 +167,47 @@ func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(d
 			return fullContent, nil
 		}
 
-		// ── 有 tool_calls → 追加历史，依次 dispatch ───────────────────
+		// ── 有 tool_calls → 并发 dispatch，等全部完成再追加 history ───
 		a.history = append(a.history, Message{
 			Role:      "assistant",
-			Content:   msg.Content,
-			ToolCalls: msg.ToolCalls,
+			Content:   "",
+			ToolCalls: toolCalls,
 		})
 
-		for _, tc := range msg.ToolCalls {
-			start := time.Now()
-			result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-			elapsed := time.Since(start).Milliseconds()
+		type dispatchResult struct {
+			tc      ToolCall
+			content string
+		}
+		results := make([]dispatchResult, len(toolCalls))
 
-			var toolContent string
-			if dispErr != nil {
-				log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
-					a.sessionID, tc.Function.Name, elapsed, dispErr)
-				toolContent = fmt.Sprintf(`{"error":%q}`, dispErr.Error())
-			} else {
-				log.Printf("[Agent %s] tool_call %s OK (%dms)",
-					a.sessionID, tc.Function.Name, elapsed)
-				toolContent = result
-			}
+		var wg sync.WaitGroup
+		for i, tc := range toolCalls {
+			wg.Add(1)
+			go func(i int, tc ToolCall) {
+				defer wg.Done()
+				start := time.Now()
+				result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				elapsed := time.Since(start).Milliseconds()
 
+				if dispErr != nil {
+					log.Printf("[Agent %s] tool_call %s FAILED (%dms): %v",
+						a.sessionID, tc.Function.Name, elapsed, dispErr)
+					results[i] = dispatchResult{tc, fmt.Sprintf(`{"error":%q}`, dispErr.Error())}
+				} else {
+					log.Printf("[Agent %s] tool_call %s OK (%dms)",
+						a.sessionID, tc.Function.Name, elapsed)
+					results[i] = dispatchResult{tc, result}
+				}
+			}(i, tc)
+		}
+		wg.Wait()
+
+		for _, r := range results {
 			a.history = append(a.history, Message{
 				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-				Content:    toolContent,
+				ToolCallID: r.tc.ID,
+				Name:       r.tc.Function.Name,
+				Content:    r.content,
 			})
 		}
 
