@@ -67,7 +67,7 @@ func newTestFactory(t *testing.T, mock *mockLLMServer) *agentfactory.Factory {
 		APIKey:  "test-key",
 		Model:   "test-model",
 		Timeout: 5,
-	}, hub)
+	}, hub, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewFactory: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestNewFactory_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := agentfactory.NewFactory(tc.cfg, tc.hub)
+			_, err := agentfactory.NewFactory(tc.cfg, tc.hub, 5*time.Second)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("wantErr=%v, got err=%v", tc.wantErr, err)
 			}
@@ -403,7 +403,7 @@ func TestDemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	f, err := agentfactory.NewFactory(llmCfg, hub)
+	f, err := agentfactory.NewFactory(llmCfg, hub, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewFactory: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestDemo_Interactive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	f, err := agentfactory.NewFactory(llmCfg, hub)
+	f, err := agentfactory.NewFactory(llmCfg, hub, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewFactory: %v", err)
 	}

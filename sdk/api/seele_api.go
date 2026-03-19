@@ -53,6 +53,8 @@ type Options struct {
 
 	// Logger 用于输出内部日志，nil 时使用标准 log 包。
 	Logger Logger
+
+	ToolCallTimeOut time.Duration
 }
 
 func (o *Options) withDefaults() {
@@ -64,6 +66,9 @@ func (o *Options) withDefaults() {
 	}
 	if o.Logger == nil {
 		o.Logger = &stdLogger{}
+	}
+	if o.ToolCallTimeOut <= 0 {
+		o.ToolCallTimeOut = 5 * time.Second
 	}
 }
 
@@ -131,7 +136,7 @@ func New(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("seele/api: load llm config %q: %w", opts.LLMConfigPath, err)
 	}
-	factory, err := agentfactory.NewFactory(llmCfg, hub)
+	factory, err := agentfactory.NewFactory(llmCfg, hub, opts.ToolCallTimeOut)
 	if err != nil {
 		return nil, fmt.Errorf("seele/api: new factory: %w", err)
 	}

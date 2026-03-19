@@ -25,15 +25,16 @@ import (
 //
 // Factory 并发安全（读写锁保护 retired 集合）。
 type Factory struct {
-	llm     *llmClient
-	hub     *hubbase.BaseHub
-	mu      sync.RWMutex
-	retired map[string]struct{} // 运行时屏蔽集合，不持久化
+	llm             *llmClient
+	hub             *hubbase.BaseHub
+	mu              sync.RWMutex
+	retired         map[string]struct{} // 运行时屏蔽集合，不持久化
+	ToolCallTimeOut time.Duration
 }
 
 // NewFactory 创建 Factory。
 // 调用前必须已调用 registry.Init 完成 registry.yaml 加载。
-func NewFactory(llmCfg LLMConfig, hub *hubbase.BaseHub) (*Factory, error) {
+func NewFactory(llmCfg LLMConfig, hub *hubbase.BaseHub, timeOut time.Duration) (*Factory, error) {
 	if hub == nil {
 		return nil, fmt.Errorf("agentFactory: hub must not be nil")
 	}
@@ -41,9 +42,10 @@ func NewFactory(llmCfg LLMConfig, hub *hubbase.BaseHub) (*Factory, error) {
 		return nil, fmt.Errorf("agentFactory: LLMConfig requires BaseURL and Model")
 	}
 	return &Factory{
-		llm:     newLLMClient(llmCfg),
-		hub:     hub,
-		retired: make(map[string]struct{}),
+		llm:             newLLMClient(llmCfg),
+		hub:             hub,
+		retired:         make(map[string]struct{}),
+		ToolCallTimeOut: timeOut,
 	}, nil
 }
 
@@ -167,9 +169,12 @@ func (f *Factory) dispatch(ctx context.Context, name, argsJSON string) (string, 
 		return "", fmt.Errorf("dispatch: skill %q build request: %w", name, err)
 	}
 
+	// 给每次 dispatch 加独立超时，防止 skill 进程无响应时永久阻塞
+	dispatchCtx, cancel := context.WithTimeout(ctx, f.ToolCallTimeOut)
+	defer cancel()
 	// 5. Hub Dispatch — 阻塞直到所有帧到齐或 ctx 超时
 	start := time.Now()
-	results := f.hub.Dispatch(ctx, req)
+	results := f.hub.Dispatch(dispatchCtx, req)
 	log.Printf("[Factory] dispatch skill=%s method=%s latency=%dms",
 		name, t.Method, time.Since(start).Milliseconds())
 

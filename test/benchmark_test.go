@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	agentfactory "github.com/sukasukasuka123/Seele"
 	hubbase "github.com/sukasukasuka123/microHub/root_class/hub"
@@ -22,7 +23,7 @@ func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfac
 		APIKey:  "bench-key",
 		Model:   "bench-model",
 		Timeout: 5,
-	}, hub)
+	}, hub, 5*time.Second)
 	if err != nil {
 		b.Fatalf("NewFactory: %v", err)
 	}
