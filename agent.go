@@ -16,9 +16,9 @@ import (
 //   - tool_call 循环上限（maxLoops，默认 8）
 //
 // 并发安全性：Agent 本身不加锁，同一个 Agent 不应跨 goroutine 并发调用。
-// 如需并发，请通过 Factory.New() 各自创建独立 Agent。
+// 如需并发，请通过 Runtime.New() 各自创建独立 Agent。
 type Agent struct {
-	factory   *Factory
+	runtime   *Runtime
 	sessionID string
 	history   []Message
 	maxLoops  int
@@ -70,10 +70,10 @@ func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
 		a.history = append(a.history, Message{Role: "user", Content: userInput})
 	}
 
-	tools := a.factory.tools()
+	tools := a.runtime.tools()
 
 	for loop := 0; loop < a.maxLoops; loop++ {
-		msg, err := a.factory.llm.complete(ctx, a.history, tools)
+		msg, err := a.runtime.llm.complete(ctx, a.history, tools)
 		if err != nil {
 			return "", fmt.Errorf("agent[%s] chat loop %d: %w", a.sessionID, loop, err)
 		}
@@ -100,7 +100,7 @@ func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
 			go func(i int, tc ToolCall) {
 				defer wg.Done()
 				start := time.Now()
-				result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				result, dispErr := a.runtime.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
 				elapsed := time.Since(start).Milliseconds()
 
 				if dispErr != nil {
@@ -125,7 +125,7 @@ func (a *Agent) Chat(ctx context.Context, userInput string) (string, error) {
 			})
 		}
 
-		tools = a.factory.tools()
+		tools = a.runtime.tools()
 	}
 
 	return "", fmt.Errorf("agent[%s]: reached maxLoops (%d) without a final text reply",
@@ -145,10 +145,11 @@ func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(d
 		a.history = append(a.history, Message{Role: "user", Content: userInput})
 	}
 
-	tools := a.factory.tools()
+	tools := a.runtime.tools()
 
 	for loop := 0; loop < a.maxLoops; loop++ {
-		fullContent, toolCalls, err := a.factory.llm.completeStream(
+		// 先开启接收的循环，防止这轮loop的内容跳过开头部分
+		fullContent, toolCalls, err := a.runtime.llm.completeStream(
 			ctx, a.history, tools,
 			func(delta string) {
 				onChunk(delta)
@@ -186,7 +187,7 @@ func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(d
 			go func(i int, tc ToolCall) {
 				defer wg.Done()
 				start := time.Now()
-				result, dispErr := a.factory.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				result, dispErr := a.runtime.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
 				elapsed := time.Since(start).Milliseconds()
 
 				if dispErr != nil {
@@ -211,7 +212,7 @@ func (a *Agent) ChatStream(ctx context.Context, userInput string, onChunk func(d
 			})
 		}
 
-		tools = a.factory.tools()
+		tools = a.runtime.tools()
 	}
 
 	return "", fmt.Errorf("agent[%s]: reached maxLoops (%d) without a final text reply",

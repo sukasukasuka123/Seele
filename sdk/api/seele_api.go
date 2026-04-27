@@ -2,7 +2,7 @@
 //
 // Seele API SDK
 //
-// 提供对 agentfactory.Factory + microHub 生命周期的高层封装，
+// 提供对 runtime.Runtime + microHub 生命周期的高层封装，
 // 屏蔽 Hub 初始化、registry 加载、路由配置等样板代码，
 // 让调用方只需关心：配置路径、system prompt、对话逻辑。
 //
@@ -26,7 +26,7 @@ import (
 	"log"
 	"time"
 
-	agentfactory "github.com/sukasukasuka123/Seele"
+	runtime "github.com/sukasukasuka123/Seele"
 	pb "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	hubbase "github.com/sukasukasuka123/microHub/root_class/hub"
 	registry "github.com/sukasukasuka123/microHub/service_registry"
@@ -91,16 +91,16 @@ func (l *stdLogger) Errorf(format string, args ...interface{}) {
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-// Engine 是 Seele API SDK 的核心对象，管理 Hub + Factory 的完整生命周期。
+// Engine 是 Seele API SDK 的核心对象，管理 Hub + Runtime 的完整生命周期。
 // 通过 New 创建，通过 Shutdown 关闭。Engine 并发安全。
 type Engine struct {
-	factory  *agentfactory.Factory
+	runtime  *runtime.Runtime
 	hub      *hubbase.BaseHub
 	opts     Options
 	shutdown chan struct{}
 }
 
-// New 初始化 Engine：加载 registry、启动 Hub、创建 Factory。
+// New 初始化 Engine：加载 registry、启动 Hub、创建 Runtime。
 //
 // 典型用法：
 //
@@ -131,18 +131,18 @@ func New(opts Options) (*Engine, error) {
 	time.Sleep(opts.HubStartupDelay)
 	opts.Logger.Infof("hub listening on %s", opts.HubAddr)
 
-	// 3. 加载 LLM 配置，创建 Factory
-	llmCfg, err := agentfactory.LoadConfig(opts.LLMConfigPath)
+	// 3. 加载 LLM 配置，创建 Runtime
+	llmCfg, err := runtime.LoadConfig(opts.LLMConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("seele/api: load llm config %q: %w", opts.LLMConfigPath, err)
 	}
-	factory, err := agentfactory.NewFactory(llmCfg, hub, opts.ToolCallTimeOut)
+	Runtime, err := runtime.NewRuntime(llmCfg, hub, opts.ToolCallTimeOut)
 	if err != nil {
-		return nil, fmt.Errorf("seele/api: new factory: %w", err)
+		return nil, fmt.Errorf("seele/api: new Runtime: %w", err)
 	}
-	eng.factory = factory
+	eng.runtime = Runtime
 
-	opts.Logger.Infof("engine ready, %d skill(s) loaded", len(factory.Skills()))
+	opts.Logger.Infof("engine ready, %d skill(s) loaded", len(Runtime.Skills()))
 	return eng, nil
 }
 
@@ -161,28 +161,28 @@ func (e *Engine) Shutdown() {
 
 // NewAgent 创建一个新的对话 Agent。
 // systemPrompt 为空时不注入 system 消息。
-func (e *Engine) NewAgent(systemPrompt string) *agentfactory.Agent {
-	return e.factory.New(systemPrompt)
+func (e *Engine) NewAgent(systemPrompt string) *runtime.Agent {
+	return e.runtime.New(systemPrompt)
 }
 
 // Skills 返回当前对 LLM 可见的 skill 摘要列表。
-func (e *Engine) Skills() []agentfactory.SkillInfo {
-	return e.factory.Skills()
+func (e *Engine) Skills() []runtime.SkillInfo {
+	return e.runtime.Skills()
 }
 
 // Retire 临时屏蔽某个 skill（重启后自动恢复）。
 func (e *Engine) Retire(name string) {
-	e.factory.Retire(name)
+	e.runtime.Retire(name)
 }
 
 // Restore 恢复被 Retire 屏蔽的 skill。
 func (e *Engine) Restore(name string) {
-	e.factory.Restore(name)
+	e.runtime.Restore(name)
 }
 
-// Factory 暴露底层 Factory，供需要精细控制的场景使用。
-func (e *Engine) Factory() *agentfactory.Factory {
-	return e.factory
+// Runtime 暴露底层 Runtime，供需要精细控制的场景使用。
+func (e *Engine) Runtime() *runtime.Runtime {
+	return e.runtime
 }
 
 // ── 便捷方法 ──────────────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ type AgentPool struct {
 
 type namedAgent struct {
 	label string
-	agent *agentfactory.Agent
+	agent *runtime.Agent
 }
 
 // NewAgentPool 创建空的 AgentPool。
@@ -240,7 +240,7 @@ func (p *AgentPool) Switch(idx int) error {
 }
 
 // Current 返回当前活跃的 Agent。
-func (p *AgentPool) Current() *agentfactory.Agent {
+func (p *AgentPool) Current() *runtime.Agent {
 	if len(p.agents) == 0 {
 		return nil
 	}

@@ -310,6 +310,7 @@ func buildToolCalls(tcMap map[int]*ToolCall) []ToolCall {
 //   - tool_call 回复：静默累积所有帧，返回 ("", toolCalls, nil)
 //
 // 调用方只需判断返回的 toolCalls 是否为空来区分两种情况。
+// 可以理解为一个接收的loop
 func (c *llmClient) completeStream(
 	ctx context.Context,
 	messages []Message,

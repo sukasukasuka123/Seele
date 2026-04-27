@@ -7,18 +7,18 @@ import (
 	"testing"
 	"time"
 
-	agentfactory "github.com/sukasukasuka123/Seele"
+	runtime "github.com/sukasukasuka123/Seele"
 	hubbase "github.com/sukasukasuka123/microHub/root_class/hub"
 )
 
 // newBenchFactory 创建用于 benchmark 的 Factory（mockLLM，不消耗真实 API）
-func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfactory.Message) *agentfactory.Factory {
+func newBenchFactory(b *testing.B, respond func([]runtime.Message) runtime.Message) *runtime.Runtime {
 	b.Helper()
 	mock := newMockLLM(respond)
 	b.Cleanup(mock.close)
 
 	hub := hubbase.New(&stubHubHandler{})
-	f, err := agentfactory.NewFactory(agentfactory.LLMConfig{
+	f, err := runtime.NewRuntime(runtime.LLMConfig{
 		BaseURL: mock.baseURL(),
 		APIKey:  "bench-key",
 		Model:   "bench-model",
@@ -30,9 +30,9 @@ func newBenchFactory(b *testing.B, respond func([]agentfactory.Message) agentfac
 	return f
 }
 
-func plainResponder(content string) func([]agentfactory.Message) agentfactory.Message {
-	return func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: content}
+func plainResponder(content string) func([]runtime.Message) runtime.Message {
+	return func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{Role: "assistant", Content: content}
 	}
 }
 

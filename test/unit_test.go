@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	agentfactory "github.com/sukasukasuka123/Seele"
+	runtime "github.com/sukasukasuka123/Seele"
 
 	pb "github.com/sukasukasuka123/microHub/proto/gen/proto"
 	hubbase "github.com/sukasukasuka123/microHub/root_class/hub"
@@ -26,14 +26,14 @@ import (
 
 type mockLLMServer struct {
 	srv     *httptest.Server
-	respond func(msgs []agentfactory.Message) agentfactory.Message
+	respond func(msgs []runtime.Message) runtime.Message
 }
 
-func newMockLLM(respond func(msgs []agentfactory.Message) agentfactory.Message) *mockLLMServer {
+func newMockLLM(respond func(msgs []runtime.Message) runtime.Message) *mockLLMServer {
 	m := &mockLLMServer{respond: respond}
 	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Messages []agentfactory.Message `json:"messages"`
+			Messages []runtime.Message `json:"messages"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		reply := m.respond(req.Messages)
@@ -59,17 +59,17 @@ func (h *stubHubHandler) Execute(*pb.ToolRequest) ([]hubbase.DispatchTarget, err
 func (h *stubHubHandler) OnResults([]hubbase.DispatchResult)                        {}
 func (h *stubHubHandler) Addrs() []string                                           { return nil }
 
-func newTestFactory(t *testing.T, mock *mockLLMServer) *agentfactory.Factory {
+func newTestFactory(t *testing.T, mock *mockLLMServer) *runtime.Runtime {
 	t.Helper()
 	hub := hubbase.New(&stubHubHandler{})
-	f, err := agentfactory.NewFactory(agentfactory.LLMConfig{
+	f, err := runtime.NewRuntime(runtime.LLMConfig{
 		BaseURL: mock.baseURL(),
 		APIKey:  "test-key",
 		Model:   "test-model",
 		Timeout: 5,
 	}, hub, 5*time.Second)
 	if err != nil {
-		t.Fatalf("NewFactory: %v", err)
+		t.Fatalf("NewRuntime: %v", err)
 	}
 	return f
 }
@@ -111,22 +111,22 @@ func waitPort(t *testing.T, addr string, timeout time.Duration) {
 
 // ── Unit Tests ──────────────────────────────────────────────────
 
-func TestNewFactory_Validation(t *testing.T) {
+func TestNewRuntime_Validation(t *testing.T) {
 	hub := hubbase.New(&stubHubHandler{})
 	cases := []struct {
 		name    string
-		cfg     agentfactory.LLMConfig
+		cfg     runtime.LLMConfig
 		hub     *hubbase.BaseHub
 		wantErr bool
 	}{
-		{"hub nil", agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"}, nil, true},
-		{"missing BaseURL", agentfactory.LLMConfig{Model: "m"}, hub, true},
-		{"missing Model", agentfactory.LLMConfig{BaseURL: "http://x"}, hub, true},
-		{"valid", agentfactory.LLMConfig{BaseURL: "http://x", Model: "m"}, hub, false},
+		{"hub nil", runtime.LLMConfig{BaseURL: "http://x", Model: "m"}, nil, true},
+		{"missing BaseURL", runtime.LLMConfig{Model: "m"}, hub, true},
+		{"missing Model", runtime.LLMConfig{BaseURL: "http://x"}, hub, true},
+		{"valid", runtime.LLMConfig{BaseURL: "http://x", Model: "m"}, hub, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := agentfactory.NewFactory(tc.cfg, tc.hub, 5*time.Second)
+			_, err := runtime.NewRuntime(tc.cfg, tc.hub, 5*time.Second)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("wantErr=%v, got err=%v", tc.wantErr, err)
 			}
@@ -138,8 +138,8 @@ func TestFactory_RetireRestore(t *testing.T) {
 	if err := registry.Init("../config_example/registry.yaml"); err != nil {
 		t.Skipf("registry.yaml not found: %v", err)
 	}
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{Role: "assistant", Content: "ok"}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -169,8 +169,8 @@ func TestFactory_RetireRestore(t *testing.T) {
 }
 
 func TestFactory_New_SystemPrompt(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{Role: "assistant", Content: "ok"}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -187,8 +187,8 @@ func TestFactory_New_SystemPrompt(t *testing.T) {
 }
 
 func TestAgent_ClearHistory(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{Role: "assistant", Content: "ok"}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -216,9 +216,9 @@ func TestAgent_ClearHistory(t *testing.T) {
 }
 
 func TestAgent_Chat_PlainReply(t *testing.T) {
-	mock := newMockLLM(func(msgs []agentfactory.Message) agentfactory.Message {
+	mock := newMockLLM(func(msgs []runtime.Message) runtime.Message {
 		last := msgs[len(msgs)-1]
-		return agentfactory.Message{Role: "assistant", Content: "你说了：" + last.Content}
+		return runtime.Message{Role: "assistant", Content: "你说了：" + last.Content}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -238,9 +238,9 @@ func TestAgent_Chat_PlainReply(t *testing.T) {
 
 func TestAgent_Chat_MultiTurn(t *testing.T) {
 	turn := 0
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
 		turn++
-		return agentfactory.Message{Role: "assistant", Content: fmt.Sprintf("第%d轮回复", turn)}
+		return runtime.Message{Role: "assistant", Content: fmt.Sprintf("第%d轮回复", turn)}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -262,16 +262,16 @@ func TestAgent_Chat_MultiTurn(t *testing.T) {
 
 func TestAgent_Chat_ToolCall(t *testing.T) {
 	callCount := 0
-	mock := newMockLLM(func(msgs []agentfactory.Message) agentfactory.Message {
+	mock := newMockLLM(func(msgs []runtime.Message) runtime.Message {
 		callCount++
 		if callCount == 1 {
-			return agentfactory.Message{
+			return runtime.Message{
 				Role: "assistant",
-				ToolCalls: []agentfactory.ToolCall{
+				ToolCalls: []runtime.ToolCall{
 					{
 						ID:   "call_001",
 						Type: "function",
-						Function: agentfactory.ToolCallFunction{
+						Function: runtime.ToolCallFunction{
 							Name:      "echo",
 							Arguments: `{"message":"hi"}`,
 						},
@@ -281,10 +281,10 @@ func TestAgent_Chat_ToolCall(t *testing.T) {
 		}
 		for _, m := range msgs {
 			if m.Role == "tool" && m.Name == "echo" {
-				return agentfactory.Message{Role: "assistant", Content: "echo 已执行：" + m.Content}
+				return runtime.Message{Role: "assistant", Content: "echo 已执行：" + m.Content}
 			}
 		}
-		return agentfactory.Message{Role: "assistant", Content: "完成"}
+		return runtime.Message{Role: "assistant", Content: "完成"}
 	})
 	defer mock.close()
 
@@ -297,14 +297,14 @@ func TestAgent_Chat_ToolCall(t *testing.T) {
 }
 
 func TestAgent_Chat_MaxLoops(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{
 			Role: "assistant",
-			ToolCalls: []agentfactory.ToolCall{
+			ToolCalls: []runtime.ToolCall{
 				{
 					ID:   "call_loop",
 					Type: "function",
-					Function: agentfactory.ToolCallFunction{
+					Function: runtime.ToolCallFunction{
 						Name:      "echo",
 						Arguments: `{"message":"loop"}`,
 					},
@@ -326,8 +326,8 @@ func TestAgent_Chat_MaxLoops(t *testing.T) {
 }
 
 func TestAgent_SessionID(t *testing.T) {
-	mock := newMockLLM(func(_ []agentfactory.Message) agentfactory.Message {
-		return agentfactory.Message{Role: "assistant", Content: "ok"}
+	mock := newMockLLM(func(_ []runtime.Message) runtime.Message {
+		return runtime.Message{Role: "assistant", Content: "ok"}
 	})
 	defer mock.close()
 	f := newTestFactory(t, mock)
@@ -347,7 +347,7 @@ func TestAgent_SessionID(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	cfg, err := agentfactory.LoadConfig("config.yaml")
+	cfg, err := runtime.LoadConfig("config.yaml")
 	if err != nil {
 		t.Skipf("config.yaml not found: %v", err)
 	}
@@ -399,13 +399,13 @@ func TestDemo(t *testing.T) {
 	}()
 	time.Sleep(200 * time.Millisecond)
 
-	llmCfg, err := agentfactory.LoadConfig("config.yaml")
+	llmCfg, err := runtime.LoadConfig("config.yaml")
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	f, err := agentfactory.NewFactory(llmCfg, hub, 5*time.Second)
+	f, err := runtime.NewRuntime(llmCfg, hub, 5*time.Second)
 	if err != nil {
-		t.Fatalf("NewFactory: %v", err)
+		t.Fatalf("NewRuntime: %v", err)
 	}
 	t.Logf("已加载 %d 个 skill", len(f.Skills()))
 
@@ -419,7 +419,7 @@ func TestDemo(t *testing.T) {
 	defer cancel()
 
 	cases := []struct {
-		agent *agentfactory.Agent
+		agent *runtime.Agent
 		label string
 		input string
 	}{
@@ -472,13 +472,13 @@ func TestDemo_Interactive(t *testing.T) {
 	go func() { _ = hub.ServeAsync(":50051", 0) }()
 	time.Sleep(200 * time.Millisecond)
 
-	llmCfg, err := agentfactory.LoadConfig("config.yaml")
+	llmCfg, err := runtime.LoadConfig("config.yaml")
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	f, err := agentfactory.NewFactory(llmCfg, hub, 5*time.Second)
+	f, err := runtime.NewRuntime(llmCfg, hub, 5*time.Second)
 	if err != nil {
-		t.Fatalf("NewFactory: %v", err)
+		t.Fatalf("NewRuntime: %v", err)
 	}
 
 	a := f.New("你是 suka-eva，一个通过微服务架构动态扩展 skill 的 AI 助手。")
