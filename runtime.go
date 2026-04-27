@@ -25,7 +25,7 @@ import (
 //
 // Runtime 并发安全（读写锁保护 retired 集合）。
 type Runtime struct {
-	llm             *llmClient
+	llm             *chatClient
 	hub             *hubbase.BaseHub
 	mu              sync.RWMutex
 	retired         map[string]struct{} // 运行时屏蔽集合，不持久化
@@ -42,7 +42,7 @@ func NewRuntime(llmCfg LLMConfig, hub *hubbase.BaseHub, timeOut time.Duration) (
 		return nil, fmt.Errorf("agentRuntime: LLMConfig requires BaseURL and Model")
 	}
 	return &Runtime{
-		llm:             newLLMClient(llmCfg),
+		llm:             newChatClient(llmCfg),
 		hub:             hub,
 		retired:         make(map[string]struct{}),
 		ToolCallTimeOut: timeOut,

@@ -12,19 +12,19 @@ import (
 	"time"
 )
 
-// llmClient 是对 OpenAI 兼容 /v1/chat/completions 的轻量封装。
+// chatClient 是对 OpenAI 兼容 /v1/chat/completions 的轻量封装。
 // 无第三方依赖，纯标准库 net/http。
-type llmClient struct {
+type chatClient struct {
 	cfg    LLMConfig
 	client *http.Client
 }
 
-func newLLMClient(cfg LLMConfig) *llmClient {
+func newChatClient(cfg LLMConfig) *chatClient {
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = 60
 	}
-	return &llmClient{
+	return &chatClient{
 		cfg:    cfg,
 		client: &http.Client{Timeout: time.Duration(timeout) * time.Second},
 	}
@@ -59,7 +59,7 @@ type chatCompletionResponse struct {
 //
 //   - 若模型发起 tool_calls，Message.ToolCalls 非空，Message.Content 可能为空。
 //   - 若模型直接回复，Message.Content 为文本，Message.ToolCalls 为空。
-func (c *llmClient) complete(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
+func (c *chatClient) complete(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
 	temperature := c.cfg.Temperature
 	if temperature == 0 {
 		temperature = 1.0
@@ -77,7 +77,7 @@ func (c *llmClient) complete(ctx context.Context, messages []Message, tools []To
 
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
-		return Message{}, fmt.Errorf("llmClient: marshal request: %w", err)
+		return Message{}, fmt.Errorf("chatClient: marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(
@@ -87,32 +87,32 @@ func (c *llmClient) complete(ctx context.Context, messages []Message, tools []To
 		bytes.NewReader(raw),
 	)
 	if err != nil {
-		return Message{}, fmt.Errorf("llmClient: build request: %w", err)
+		return Message{}, fmt.Errorf("chatClient: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return Message{}, fmt.Errorf("llmClient: HTTP: %w", err)
+		return Message{}, fmt.Errorf("chatClient: HTTP: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return Message{}, fmt.Errorf("llmClient: read response: %w", err)
+		return Message{}, fmt.Errorf("chatClient: read response: %w", err)
 	}
 
 	var cr chatCompletionResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
-		return Message{}, fmt.Errorf("llmClient: parse response: %w\nraw: %.512s", err, data)
+		return Message{}, fmt.Errorf("chatClient: parse response: %w\nraw: %.512s", err, data)
 	}
 	if cr.Error != nil {
-		return Message{}, fmt.Errorf("llmClient: API error [%s/%s]: %s",
+		return Message{}, fmt.Errorf("chatClient: API error [%s/%s]: %s",
 			cr.Error.Type, cr.Error.Code, cr.Error.Message)
 	}
 	if len(cr.Choices) == 0 {
-		return Message{}, fmt.Errorf("llmClient: empty choices\nraw: %.512s", data)
+		return Message{}, fmt.Errorf("chatClient: empty choices\nraw: %.512s", data)
 	}
 
 	return cr.Choices[0].Message, nil
@@ -169,7 +169,7 @@ type chatCompletionStreamResponse struct {
 
 // doStreamRequest 构造并发送流式 HTTP 请求，返回响应 body。
 // 调用方负责关闭 body。
-func (c *llmClient) doStreamRequest(ctx context.Context, messages []Message, tools []Tool) (io.ReadCloser, error) {
+func (c *chatClient) doStreamRequest(ctx context.Context, messages []Message, tools []Tool) (io.ReadCloser, error) {
 	temperature := c.cfg.Temperature
 	if temperature == 0 {
 		temperature = 1.0
@@ -242,7 +242,7 @@ func newSSEState() *sseState {
 //   - 文本帧：delta.Content 非空，追加进 sb，并调用 onChunk 实时推给调用方
 //
 // 返回 error 时调用方应中止整个流。
-func (c *llmClient) processFrame(payload string, state *sseState, onChunk func(string)) error {
+func (c *chatClient) processFrame(payload string, state *sseState, onChunk func(string)) error {
 	var frame chatCompletionStreamResponse
 	if err := json.Unmarshal([]byte(payload), &frame); err != nil {
 		// 无法解析的帧直接跳过，不中断流。
@@ -311,7 +311,7 @@ func buildToolCalls(tcMap map[int]*ToolCall) []ToolCall {
 //
 // 调用方只需判断返回的 toolCalls 是否为空来区分两种情况。
 // 可以理解为一个接收的loop
-func (c *llmClient) completeStream(
+func (c *chatClient) completeStream(
 	ctx context.Context,
 	messages []Message,
 	tools []Tool,
@@ -321,7 +321,7 @@ func (c *llmClient) completeStream(
 	// 1. 建立 SSE 连接
 	body, err := c.doStreamRequest(ctx, messages, tools)
 	if err != nil {
-		return "", nil, fmt.Errorf("llmClient stream: %w", err)
+		return "", nil, fmt.Errorf("chatClient stream: %w", err)
 	}
 	defer body.Close()
 
@@ -342,7 +342,7 @@ func (c *llmClient) completeStream(
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload != "" {
 				if err := c.processFrame(payload, state, onChunk); err != nil {
-					return "", nil, fmt.Errorf("llmClient stream: %w", err)
+					return "", nil, fmt.Errorf("chatClient stream: %w", err)
 				}
 			}
 		}
@@ -351,7 +351,7 @@ func (c *llmClient) completeStream(
 			break
 		}
 		if readErr != nil {
-			return "", nil, fmt.Errorf("llmClient stream: read SSE: %w", readErr)
+			return "", nil, fmt.Errorf("chatClient stream: read SSE: %w", readErr)
 		}
 	}
 
