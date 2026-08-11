@@ -272,6 +272,50 @@ func TestMemoryTracerQueryAndStreamFilters(t *testing.T) {
 	root.End(ctx, StatusOK, nil)
 }
 
+func TestMemoryTracerQueryPreservesSameTimestampWriteOrder(t *testing.T) {
+	tracer := NewMemoryTracer()
+	ctx, root, err := tracer.StartTrace(context.Background(), "agent", SpanAgent, nil)
+	if err != nil {
+		t.Fatalf("start trace: %v", err)
+	}
+	traceCtx, _ := TraceFromContext(ctx)
+	now := time.Unix(1700000000, 0).UTC()
+	events := []Event{
+		{Timestamp: now, Type: EventLLMBefore, Phase: PhaseBefore, Name: "llm-1", CorrelationID: "call-1", TraceID: traceCtx.TraceID, SpanID: traceCtx.SpanID},
+		{Timestamp: now, Type: EventLLMAfter, Phase: PhaseAfter, Name: "llm-1", CorrelationID: "call-1", TraceID: traceCtx.TraceID, SpanID: traceCtx.SpanID},
+		{Timestamp: now, Type: EventLLMBefore, Phase: PhaseBefore, Name: "llm-2", CorrelationID: "call-2", TraceID: traceCtx.TraceID, SpanID: traceCtx.SpanID},
+		{Timestamp: now, Type: EventLLMAfter, Phase: PhaseAfter, Name: "llm-2", CorrelationID: "call-2", TraceID: traceCtx.TraceID, SpanID: traceCtx.SpanID},
+	}
+	for _, event := range events {
+		if err := tracer.Record(ctx, event); err != nil {
+			t.Fatalf("record %s/%s: %v", event.Type, event.CorrelationID, err)
+		}
+	}
+
+	view, err := tracer.Query(context.Background(), Query{TraceID: traceCtx.TraceID})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	want := []struct {
+		Type          EventType
+		CorrelationID string
+	}{
+		{EventLLMBefore, "call-1"},
+		{EventLLMAfter, "call-1"},
+		{EventLLMBefore, "call-2"},
+		{EventLLMAfter, "call-2"},
+	}
+	if len(view.Events) != len(want) {
+		t.Fatalf("event count = %d, want %d: %#v", len(view.Events), len(want), view.Events)
+	}
+	for i, got := range view.Events {
+		if got.Type != want[i].Type || got.CorrelationID != want[i].CorrelationID {
+			t.Errorf("event %d = %s/%s, want %s/%s (same-timestamp events must preserve write order)", i, got.Type, got.CorrelationID, want[i].Type, want[i].CorrelationID)
+		}
+	}
+	root.End(ctx, StatusOK, nil)
+}
+
 func TestMemoryTracerForwardsTraceMetricAndAuditSinks(t *testing.T) {
 	sink := &capturingSink{}
 	tracer := NewMemoryTracer(WithTraceSink(sink), WithMetricSink(sink), WithAuditSink(sink))

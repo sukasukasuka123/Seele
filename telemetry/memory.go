@@ -323,7 +323,7 @@ func (t *MemoryTracer) Query(ctx context.Context, query Query) (ViewModel, error
 			}
 		}
 	}
-	sort.Slice(view.Events, func(i, j int) bool { return view.Events[i].Timestamp.Before(view.Events[j].Timestamp) })
+	sort.SliceStable(view.Events, func(i, j int) bool { return view.Events[i].Timestamp.Before(view.Events[j].Timestamp) })
 	for _, metric := range t.metrics {
 		if matchesMetric(metric, query) {
 			metric.Attributes = cloneAttributes(metric.Attributes)
